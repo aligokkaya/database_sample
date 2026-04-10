@@ -64,6 +64,7 @@ async def classify_column(
 
 class DiscoverRequest(BaseModel):
     metadata_id: str = Field(..., description="UUID of the metadata record to scan")
+    sample_count: int = Field(default=10, description="Number of sample values to check per column")
 
 
 class DiscoverColumnResult(BaseModel):
@@ -106,6 +107,7 @@ async def discover_pii(
         return await service.discover_metadata(
             db=db,
             metadata_id=body.metadata_id,
+            sample_count=body.sample_count,
         )
     except HTTPException:
         raise

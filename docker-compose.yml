@@ -1,0 +1,187 @@
+version: "3.9"
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  demo_postgres_data:
+  clinic_postgres_data:
+  ecommerce_postgres_data:
+  ollama_data:
+
+services:
+
+  # ── System Database ─────────────────────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    container_name: discovery_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-discovery_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-discovery_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── Demo / Target Database ───────────────────────────────────────────────────
+  demo_db:
+    image: postgres:15-alpine
+    container_name: demo_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: llm_discovery_demo
+    volumes:
+      - demo_postgres_data:/var/lib/postgresql/data
+      - ./demo_db.sql:/docker-entrypoint-initdb.d/demo_db.sql:ro
+    ports:
+      - "5433:5432"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d llm_discovery_demo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── E-Commerce Test Database ─────────────────────────────────────────────────
+  ecommerce_db:
+    image: postgres:15-alpine
+    container_name: ecommerce_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ecommerce_db
+    volumes:
+      - ecommerce_postgres_data:/var/lib/postgresql/data
+      - ./ecommerce_db.sql:/docker-entrypoint-initdb.d/ecommerce_db.sql:ro
+    ports:
+      - "5436:5432"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ecommerce_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── Clinic Test Database ─────────────────────────────────────────────────────
+  clinic_db:
+    image: postgres:15-alpine
+    container_name: clinic_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: clinic_db
+    volumes:
+      - clinic_postgres_data:/var/lib/postgresql/data
+      - ./test_db.sql:/docker-entrypoint-initdb.d/test_db.sql:ro
+    ports:
+      - "5435:5432"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d clinic_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── Ollama LLM Server ────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: discovery_ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── Ollama Model Pull (runs once, exits) ─────────────────────────────────────
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: discovery_ollama_init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["/bin/ollama"]
+    command: ["pull", "llama3.2:latest"]
+    networks:
+      - internal
+    restart: "no"
+
+  # ── Java Spring Boot Application ────────────────────────────────────────────
+  java-app:
+    build:
+      context: ./java
+      dockerfile: Dockerfile
+    image: discovery-java:test
+    container_name: discovery_java
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:-discovery_db}
+      DB_USERNAME: ${POSTGRES_USER:-postgres}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-24}
+      BASIC_AUTH_USERNAME: ${BASIC_AUTH_USERNAME}
+      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-ollama}
+      OPENAI_MODEL: ${OPENAI_MODEL:-llama3.2:latest}
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
+
+  # ── FastAPI Application ──────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discovery_app
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    networks:
+      - internal
+    volumes:
+      - ./app:/app/app:ro

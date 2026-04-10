@@ -461,6 +461,7 @@ async def classify_column(
 async def discover_metadata(
     db: AsyncSession,
     metadata_id: str,
+    sample_count: int = 10,
 ) -> dict[str, Any]:
     """
     Full PII discovery for an entire metadata record.
@@ -534,7 +535,7 @@ async def discover_metadata(
                 # Phase 1b – JSON/JSONB: flatten content and send to LLM
                 if dtype in JSON_TYPES:
                     try:
-                        samples = _fetch_llm_samples(conn, table.table_name, col.column_name)
+                        samples = _fetch_llm_samples(conn, table.table_name, col.column_name, sample_count)
                         flat = _flatten_json_samples(samples)
                         classifications = _call_llm(col.column_name, flat, table_name=table.table_name)
                         top_cat = max(classifications, key=lambda k: classifications[k])
@@ -563,7 +564,7 @@ async def discover_metadata(
                         continue
 
                     # Phase 4 – LLM (only truly ambiguous columns reach here)
-                    samples = _fetch_llm_samples(conn, table.table_name, col.column_name)
+                    samples = _fetch_llm_samples(conn, table.table_name, col.column_name, sample_count)
                     classifications = _call_llm(col.column_name, samples, table_name=table.table_name)
                     category = max(classifications, key=lambda k: classifications[k])
                     is_pii = category != "not_pii"
