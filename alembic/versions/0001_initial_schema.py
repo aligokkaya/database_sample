@@ -30,6 +30,7 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
+        if_not_exists=True,
     )
 
     # db_connections
@@ -53,6 +54,7 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
+        if_not_exists=True,
     )
 
     # tables_info
@@ -69,6 +71,7 @@ def upgrade() -> None:
         sa.Column(
             "schema_name", sa.String(255), nullable=False, server_default="public"
         ),
+        if_not_exists=True,
     )
 
     # columns_info
@@ -90,13 +93,26 @@ def upgrade() -> None:
         sa.Column("column_name", sa.String(255), nullable=False),
         sa.Column("data_type", sa.String(255), nullable=False),
         sa.Column("ordinal_position", sa.Integer, nullable=False),
+        if_not_exists=True,
     )
 
-    # Indexes for common lookups
-    op.create_index("ix_db_connections_metadata_id", "db_connections", ["metadata_id"])
-    op.create_index("ix_tables_info_metadata_id", "tables_info", ["metadata_id"])
-    op.create_index("ix_columns_info_table_id", "columns_info", ["table_id"])
-    op.create_index("ix_columns_info_metadata_id", "columns_info", ["metadata_id"])
+    # Indexes for common lookups (ignore if already exist)
+    try:
+        op.create_index("ix_db_connections_metadata_id", "db_connections", ["metadata_id"])
+    except Exception:
+        pass
+    try:
+        op.create_index("ix_tables_info_metadata_id", "tables_info", ["metadata_id"])
+    except Exception:
+        pass
+    try:
+        op.create_index("ix_columns_info_table_id", "columns_info", ["table_id"])
+    except Exception:
+        pass
+    try:
+        op.create_index("ix_columns_info_metadata_id", "columns_info", ["metadata_id"])
+    except Exception:
+        pass
 
 
 def downgrade() -> None:
