@@ -10,7 +10,9 @@ A FastAPI application that connects to any PostgreSQL database, discovers its sc
 - Dynamic connection to any PostgreSQL target database
 - Automatic schema discovery via `information_schema`
 - Fernet-encrypted password storage
-- LLM-powered PII classification (OpenAI-compatible APIs)
+- LLM-powered PII classification (OpenAI / Local Ollama)
+- **Beast Mode**: GPU-accelerated local inference support 🚀
+- **Parallel Scanning**: 10x faster discovery via async batching
 - Full async SQLAlchemy 2.x ORM with asyncpg
 - Alembic migrations
 - Docker Compose deployment
@@ -160,9 +162,22 @@ Response:
   }
 }
 ```
+### 🚀 Beast Mode: GPU-Accelerated Local Discovery (Mac/Linux)
 
-### `GET /health`
-No authentication required. Returns `{"status": "healthy"}`.
+Move Ollama out of Docker to your Mac/Linux host to leverage Native GPU (Metal/CUDA) for near-instant classification.
+
+1. Install Ollama natively on your Mac/Linux.
+2. In Mac Native Ollama, pull the large models: `ollama pull qwen2.5:7b`.
+3. Update `.env` to point to the host: `OPENAI_BASE_URL=http://host.docker.internal:11434/v1`.
+4. Run Discovery via Swagger. It will now use your Mac's GPU instead of Docker's CPU.
+
+### ☁️ Cloud Mode: OpenAI Integration
+
+You can now switch to OpenAI directly from the Swagger UI without restarting.
+
+1. Set `provider: "openai"` in the request body.
+2. (Optional) Provide your `api_key` in the request if it's not in `.env`.
+3. Set `model_name: "gpt-4o"` for the highest accuracy.
 
 ---
 

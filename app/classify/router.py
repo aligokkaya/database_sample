@@ -1,5 +1,4 @@
 from typing import Annotated, Any
-
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,9 +36,9 @@ class ClassifyResponse(BaseModel):
     summary="Classify a database column for PII",
 )
 async def classify_column(
-    body: ClassifyRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
-    _: Annotated[dict, Depends(get_current_user)],
+    user: Annotated[dict, Depends(get_current_user)],
+    body: ClassifyRequest,
 ) -> Any:
     """
     Classify a single database column for PII using LLM.
@@ -96,9 +95,9 @@ class DiscoverResponse(BaseModel):
     summary="Scan entire database for PII columns",
 )
 async def discover_pii(
-    body: DiscoverRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
-    _: Annotated[dict, Depends(get_current_user)],
+    user: Annotated[dict, Depends(get_current_user)],
+    body: DiscoverRequest,
 ) -> Any:
     """
     Automatically scan ALL columns in a metadata record for PII.
