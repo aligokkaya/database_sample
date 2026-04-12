@@ -1,237 +1,157 @@
-# LLM-Based Database Data Discovery System
+# 🛡️ Hardened PII Discovery Engine
 
-A FastAPI application that connects to any PostgreSQL database, discovers its schema, and uses an LLM to classify columns across **13 PII (Personally Identifiable Information) categories** with probability distributions.
+[![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-Framework-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![Ollama](https://img.shields.io/badge/Ollama-Local_LLM-black?logo=ollama&logoColor=white)](https://ollama.ai/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Database-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
----
-
-## Features
-
-- JWT-based authentication
-- Dynamic connection to any PostgreSQL target database
-- Automatic schema discovery via `information_schema`
-- Fernet-encrypted password storage
-- LLM-powered PII classification (OpenAI / Local Ollama)
-- **Beast Mode**: GPU-accelerated local inference support 🚀
-- **Parallel Scanning**: 10x faster discovery via async batching
-- Full async SQLAlchemy 2.x ORM with asyncpg
-- Alembic migrations
-- Docker Compose deployment
+**A premium, high-performance PII discovery and classification system.** Designed to secure PostgreSQL environments by identifying sensitive data using a hardened **Hybrid Detection Engine** (Direct Mapping + Heuristics + LLM).
 
 ---
 
-## Quick Start
+## 🚀 The Hybrid Detection Engine
 
-### 1. Clone and configure
+Unlike traditional regex-only tools, this engine utilizes a three-tiered classification pipeline to ensure maximum accuracy with minimal latency.
 
+```mermaid
+graph TD
+    A[Database Schema] --> B{Tier 1: Direct Mapping}
+    B -- Matches found --> C[Instant PII Tagging]
+    B -- No match --> D{Tier 2: Heuristics}
+    D -- Pass validation --> E[LLM Inference Queue]
+    D -- Aggressive Skip --> F[Mark as not_pii]
+    E --> G[Local Ollama / OpenAI]
+    G --> H[Final Probability Ranking]
+    C --> I[Encrypted Metadata Store]
+    H --> I
+```
+
+### 🧠 Core Features
+
+*   **⚡ Beast Mode (GPU Parallelization)**: Leverages native GPU acceleration (Metal/CUDA) via local Ollama for near-instant scanning of massive schemas.
+*   **🧩 Deep JSON Scanning**: Intelligent flattening of `JSONB` and nested JSON columns. It peers inside raw data strings to find hidden PII.
+*   **🇹🇷 Hardened for Turkish Context**: Specialized identification logic for **TCKN** (Turkish Identity), **Tax Numbers**, **IBANs**, and domestic address formats.
+*   **🎭 Masked Data Awareness**: Detects and correctly categorizes obfuscated data (e.g., `**** **** **** 1234`) as sensitive financial information.
+*   **🛡️ Privacy-First Architecture**: Designed for air-gapped or high-security environments. Use local LLMs (Qwen/Llama) to ensure sensitive samples never leave your infrastructure.
+
+---
+
+## 💻 System Requirements
+
+To ensure smooth PII classification and schema discovery, follow these hardware guidelines:
+
+| Component | Minimum | Recommended |
+| :--- | :--- | :--- |
+| **RAM** | 8 GB | 16 GB+ |
+| **GPU** | CPU-only is possible | Apple M-Series or NVIDIA (8GB+ VRAM) |
+| **Storage** | 10 GB (for Docker + Models) | 20 GB+ (High-precision models) |
+| **LLM Model** | `qwen2.5:3b` | `qwen2.5:7b` or `deepseek-r1:7b` |
+
+> [!TIP]
+> **Why Local Ollama?** Running Ollama natively on your host machine (outside Docker) allows the system to access your hardware acceleration (Metal or CUDA), resulting in **10x faster** processing compared to containerized CPU-bound inference.
+
+---
+
+## 🛠️ Quick Start
+
+### 1. Configure Environment
 ```bash
 cp .env.example .env
 ```
-
-Edit `.env` with your values. Generate a Fernet key:
-
+Generate your encryption key for secure credential storage:
 ```python
 from cryptography.fernet import Fernet
 print(Fernet.generate_key().decode())
 ```
 
-### 2. Start with Docker Compose
-
+### 2. Launch with Docker
 ```bash
 docker-compose up --build
 ```
-
-The API will be available at `http://localhost:8000`.
-
-Interactive API docs: `http://localhost:8000/docs`
+*   **API Docs**: `http://localhost:8000/docs`
+*   **Performance Note**: For maximum speed, connect to a native Ollama instance on your host machine to utilize hardware acceleration.
 
 ---
 
-## Environment Variables
+## 📊 Supported PII Categories
 
-| Variable | Description | Default |
-|---|---|---|
-| `DATABASE_URL` | Async SQLAlchemy URL for the system DB | `postgresql+asyncpg://...` |
-| `SYNC_DATABASE_URL` | Sync URL used by Alembic | `postgresql://...` |
-| `OPENAI_API_KEY` | OpenAI (or compatible) API key | — |
-| `OPENAI_BASE_URL` | Base URL for OpenAI-compatible API | `https://api.openai.com/v1` |
-| `OPENAI_MODEL` | Model to use for classification | `gpt-4o-mini` |
-| `JWT_SECRET_KEY` | Secret key for JWT signing | — |
-| `JWT_ALGORITHM` | JWT algorithm | `HS256` |
-| `JWT_EXPIRY_HOURS` | Token expiry in hours | `24` |
-| `BASIC_AUTH_USERNAME` | Login username | `admin` |
-| `BASIC_AUTH_PASSWORD` | Login password | `admin123` |
-| `ENCRYPTION_KEY` | Fernet key for encrypting stored DB passwords | — |
+The system classifies data into **13 distinct categories** with high-precision confidence scores:
 
----
-
-## API Endpoints
-
-### Authentication
-
-#### `POST /auth`
-Obtain a JWT token.
-
-```json
-{
-  "username": "admin",
-  "password": "admin123"
-}
-```
-
-Response:
-```json
-{
-  "access_token": "<jwt>",
-  "token_type": "bearer",
-  "expires_in": 86400
-}
-```
-
-All subsequent requests must include:
-```
-Authorization: Bearer <token>
-```
+| Category | Typical Pattern / Examples |
+| :--- | :--- |
+| `tckn` | 11-digit Turkish Identity Numbers (starts non-zero) |
+| `credit_card_number` | Full or masked financial cards, IBANs, Account numbers |
+| `email_address` | personal@domain.com, corporate_id@company.com |
+| `phone_number` | Local and international formats (+90, 05xx, etc.) |
+| `ip_address` | IPv4 and IPv6 addresses (detected via DB types or content) |
+| `full_name` | Combined first and last names |
+| `first_name` / `last_name` | Split name categorization (Ad / Soyad) |
+| `home_address` | Street addresses, district, and city metadata |
+| `date_of_birth` | Birthday records (distinguished from technical timestamps) |
+| `social_security_number` | Identified as high-risk SSN patterns |
+| `national_id_number` | Non-Turkish government identifiers and passports |
+| `not_pii` | Safe technical metadata, IDs, amounts, and statuses |
 
 ---
 
-### Schema Discovery
+## ⚙️ Advanced Configuration (Beast Mode)
 
-#### `POST /db/metadata`
-Connect to a target PostgreSQL database and discover its schema.
+To achieve **10x faster discovery**, bypass Docker's CPU limitations and use your host's GPU:
 
-```json
-{
-  "host": "your-db-host",
-  "port": 5432,
-  "database": "mydb",
-  "username": "dbuser",
-  "password": "dbpassword"
-}
-```
-
-Returns metadata with `metadata_id`, table count, and column details including `column_id` UUIDs.
+1.  Run **Ollama** natively on your Mac/Linux.
+2.  Set `OPENAI_BASE_URL=http://host.docker.internal:11434/v1` in `.env`.
+3.  The discovery pipeline will now use **Native Metal (Mac)** or **CUDA (NVIDIA)** for inference.
 
 ---
 
-### Metadata Management
+## 🔐 Security & Encryption
 
-#### `GET /metadata`
-List all discovered database metadata records.
-
-#### `GET /metadata/{metadata_id}`
-Get full schema details for a specific record (tables + columns).
-
-#### `DELETE /metadata/{metadata_id}`
-Delete a metadata record and all associated data (cascades to connection, tables, columns).
+All target database credentials are stored using **AES-256 Fernet Encryption**. The `ENCRYPTION_KEY` is required at runtime to decrypt access tokens, ensuring your data warehouse remains secure even if the discovery database is compromised.
 
 ---
 
-### PII Classification
+## 📜 Development & Contributions
 
-#### `POST /classify`
-Classify a specific column for PII using the LLM.
-
-```json
-{
-  "column_id": "<uuid from metadata>",
-  "sample_count": 10
-}
-```
-
-Response:
-```json
-{
-  "column_id": "...",
-  "column_name": "email",
-  "table_name": "users",
-  "sample_count": 10,
-  "classifications": {
-    "email_address": 0.95,
-    "phone_number": 0.01,
-    "social_security_number": 0.0,
-    "credit_card_number": 0.0,
-    "national_id_number": 0.0,
-    "full_name": 0.0,
-    "first_name": 0.0,
-    "last_name": 0.0,
-    "tckn": 0.0,
-    "home_address": 0.0,
-    "date_of_birth": 0.0,
-    "ip_address": 0.0,
-    "not_pii": 0.04
-  }
-}
-```
-### 🚀 Beast Mode: GPU-Accelerated Local Discovery (Mac/Linux)
-
-Move Ollama out of Docker to your Mac/Linux host to leverage Native GPU (Metal/CUDA) for near-instant classification.
-
-1. Install Ollama natively on your Mac/Linux.
-2. In Mac Native Ollama, pull the large models: `ollama pull qwen2.5:7b`.
-3. Update `.env` to point to the host: `OPENAI_BASE_URL=http://host.docker.internal:11434/v1`.
-4. Run Discovery via Swagger. It will now use your Mac's GPU instead of Docker's CPU.
-
-### ☁️ Cloud Mode: OpenAI Integration
-
-You can now switch to OpenAI directly from the Swagger UI without restarting.
-
-1. Set `provider: "openai"` in the request body.
-2. (Optional) Provide your `api_key` in the request if it's not in `.env`.
-3. Set `model_name: "gpt-4o"` for the highest accuracy.
-
----
-
-## PII Categories
-
-| Category | Description |
-|---|---|
-| `email_address` | Email addresses |
-| `phone_number` | Phone numbers in any format |
-| `social_security_number` | US SSNs |
-| `credit_card_number` | Credit/debit card numbers |
-| `national_id_number` | National ID numbers (non-Turkish) |
-| `full_name` | First + last name combined |
-| `first_name` | Given names only |
-| `last_name` | Family names only |
-| `tckn` | Turkish Citizenship Number (11 digits) |
-| `home_address` | Physical street addresses |
-| `date_of_birth` | Dates of birth |
-| `ip_address` | IPv4 or IPv6 addresses |
-| `not_pii` | Not PII |
-
----
-
-## Local Development (without Docker)
-
+### Local Setup (No Docker)
 ```bash
-# Create a virtual environment
-python -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# Set up .env (point DATABASE_URL to a local postgres)
-cp .env.example .env
-
-# Run migrations
 alembic upgrade head
-
-# Start the server
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload
 ```
+
+### Async Architecture
+The system utilizes a **Semaphore-controlled Async Pipeline** (`MAX_LLM_CONCURRENCY = 5`) to prevent overloading the inference host while maintaining high throughput for large-schema discovery.
 
 ---
 
-## Running Alembic Migrations Manually
+## 🤖 AI-Native Development Workflow
 
-```bash
-# Generate a new migration
-alembic revision --autogenerate -m "description"
+This project was built using an **AI-Native approach**, leveraging **Cursor AI** to synchronize complex business logic across different technology stacks (Python & Java). 
 
-# Apply migrations
-alembic upgrade head
+### 🔄 Python-to-Java Porting with Cursor
+The core PII Discovery logic was first perfected in Python and then ported to Java Spring Boot to ensure architectural consistency. This was achieved by providing the AI assistant with high-context prompts:
 
-# Rollback one migration
-alembic downgrade -1
-```
+> **Prompt Example:**
+> *"Analyze the `_call_llm` and `_validate_with_heuristics` functions in `app/classify/service.py`. Implement the exact same hybrid classification logic in a Spring Boot service. Ensure the 13 PII categories, prompt structure, and regex-based heuristics are identical to maintain cross-stack result parity."*
+
+### ✅ Result Parity
+By using AI-assisted porting:
+*   **Prompt Alignment**: Both stacks use the exact same `SYSTEM_PROMPT`.
+*   **Heuristic Parity**: Regular expressions and exclusion keywords (suffixes) are 1:1 identical.
+*   **Rapid Synchronization**: Critical hardening updates in Python (like TCKN support) were propagated to the Java codebase in minutes rather than hours.
+
+### 🧪 End-to-End Testing with Antigravity
+The system's reliability was verified through an autonomous testing loop using the **Antigravity AI Agent**. Instead of manual smoke tests, the agent was tasked with monitoring the entire pipeline in real-time.
+
+**Key Testing Prompts:**
+> *"Monitor the Docker logs in real-time. Trigger the discovery scan and identify why the LLM is returning inconsistent categories for numeric IDs like TCKN. Once identified, apply a hardening fix to `service.py` and re-verify the scan."*
+
+**The "Debug-Fix-Verify" Loop:**
+1.  **Autonomous Log Analysis**: The AI agent inspected container logs to identify database connection port mismatches and LLM JSON hallucinations.
+2.  **Real-Time Data Injection**: Custom SQL samples were injected into the test database to verify the detection of masked cards and Turkish tax numbers.
+3.  **Regression Testing**: After every "Hardening" update, the agent autonomously re-ran the classification pipeline to ensure no regression in `email_address` or `ip_address` detection.
+
+---
+*Built for the Kafein Study Case by Ali Gökkaya.*

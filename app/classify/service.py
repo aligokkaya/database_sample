@@ -27,22 +27,22 @@ settings = get_settings()
 PII_CATEGORIES = [
     "email_address", "phone_number", "social_security_number", "credit_card_number",
     "national_id_number", "full_name", "first_name", "last_name", "tckn",
-    "home_address", "date_of_birth", "ip_address", "bank_account_iban", "tax_number", "not_pii"
+    "home_address", "date_of_birth", "ip_address", "not_pii"
 ]
 
 # ── LLM System Prompt ──────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Analyze sample data for PII. You MUST return a JSON with counts.
 
-ALLOWED KEYS: email_address, phone_number, social_security_number, credit_card_number, tckn, national_id_number, full_name, first_name, last_name, home_address, date_of_birth, ip_address, bank_account_iban, tax_number, not_pii.
+ALLOWED KEYS: email_address, phone_number, social_security_number, credit_card_number, tckn, national_id_number, full_name, first_name, last_name, home_address, date_of_birth, ip_address, not_pii.
 
 GUIDELINES:
-- Turkish TCKN (11 digits) -> 'tckn'
-- Tax Numbers (10 digits) -> 'tax_number'
+- Turkish TCKN (11 digits, starts non-zero) -> 'tckn'
+- IBAN / bank account numbers -> 'credit_card_number'
 - IP Addresses (IPv4/v6) -> 'ip_address'
-- Masked Data (****) -> Use appropriate category (e.g., 'credit_card_number')
+- Masked card data (****) -> 'credit_card_number'
 - No such PII? -> 'not_pii'
 
-REQUIRED OUTPUT: {"tckn": 0, "email_address": 0, ...} (All 15 keys)"""
+REQUIRED OUTPUT: {"email_address": 0, "phone_number": 0, ...} (All 13 keys)"""
 
 # ── Globals ───────────────────────────────────────────────────────────────────
 NEGATIVE_PII_KEYWORDS = {
@@ -95,15 +95,11 @@ DIRECT_COLUMN_PATTERNS: list[tuple[str, str]] = [
     ("tckn",             "tckn"),
     ("tc_no",            "tckn"),
     ("kimlik",           "tckn"),
-    # ── IBAN / Bank ──
-    ("iban",             "bank_account_iban"),
-    ("bank_account",     "bank_account_iban"),
+    # ── IBAN / Bank → credit_card_number (closest financial category) ──
+    ("iban",             "credit_card_number"),
+    ("bank_account",     "credit_card_number"),
     # ── IP ──
     ("ip_address",       "ip_address"),
-    # ── Tax ──
-    ("tax_number",       "tax_number"),
-    ("tax_no",           "tax_number"),
-    ("vergi",            "tax_number"),
     # ── SSN ──
     ("social_security",  "social_security_number"),
     ("ssn",              "social_security_number"),
@@ -160,9 +156,8 @@ def _call_llm(column_name: str, samples: list[str], table_name: str = "") -> dic
         
         if k_lower in cleaned: cleaned[k_lower] += val
         elif any(x in k_lower for x in ["card", "cc"]): cleaned["credit_card_number"] += val
-        elif any(x in k_lower for x in ["tax", "vergi"]): cleaned["tax_number"] += val
+        elif any(x in k_lower for x in ["iban", "bank", "acc"]): cleaned["credit_card_number"] += val
         elif any(x in k_lower for x in ["tckn", "tc", "national", "citizen", "identity", "kimlik"]): cleaned["tckn"] += val
-        elif any(x in k_lower for x in ["iban", "bank", "acc"]): cleaned["bank_account_iban"] += val
         elif any(x in k_lower for x in ["ip", "host"]): cleaned["ip_address"] += val
         elif any(x in k_lower for x in ["phone", "tel"]): cleaned["phone_number"] += val
         elif any(x in k_lower for x in ["birth", "dob", "dogum"]): cleaned["date_of_birth"] += val
@@ -194,9 +189,7 @@ def _validate_with_heuristics(category: str, samples: list[str], column_name: st
     if category == "email_address": return "@" in blob and "." in blob
     if category == "ip_address": return bool(re.search(r"(\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{5,}", blob))
     if category == "tckn": return bool(re.search(r"[1-9]\d{10}", blob.replace(" ", "")))
-    if category == "tax_number": return bool(re.search(r"\d{10}", blob.replace(" ", "")))
     if category == "credit_card_number": return "*" in blob or len(re.sub(r"\D", "", blob)) >= 13
-    if category == "bank_account_iban": return len(re.sub(r"\D", "", blob)) > 8 or "tr" in blob or "iban" in t_col
     if category == "date_of_birth":
         rejects = {"created", "updated", "hire", "registration", "order", "login"}
         return not any(r in t_col for r in rejects) and bool(re.search(r"\d", blob))
@@ -291,34 +284,106 @@ def _execute_discovery_pipeline(table_name: str, col_name: str, dtype: str, db_c
     print(f"DEBUG: [PII MATCH] {table_name}.{col_name} -> {top_cat}", flush=True)
     return {"top_category": top_cat, "top_probability": final[top_cat], "classifications": final, "sample_count": len(raw)}
 
+MAX_LLM_CONCURRENCY = 5  # Max parallel LLM calls — prevents overloading Ollama
+
 async def discover_metadata(db: AsyncSession, metadata_id: str, sample_count: int = 10) -> dict:
-    res = await db.execute(select(MetadataRecord).options(selectinload(MetadataRecord.tables).selectinload(TableInfo.columns)).where(MetadataRecord.id == uuid.UUID(metadata_id)))
-    record = res.scalar_one_or_none()
-    if not record: raise HTTPException(status_code=404)
-    conn_res = await db.execute(select(DbConnection).where(DbConnection.metadata_id == uuid.UUID(metadata_id)))
-    db_conn = conn_res.scalar_one_or_none()
-    pwd = decrypt_password(db_conn.encrypted_password)
     import asyncio
+
+    # UUID validation
+    try:
+        meta_uuid = uuid.UUID(metadata_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid metadata_id: '{metadata_id}' is not a valid UUID.",
+        )
+
+    res = await db.execute(
+        select(MetadataRecord)
+        .options(selectinload(MetadataRecord.tables).selectinload(TableInfo.columns))
+        .where(MetadataRecord.id == meta_uuid)
+    )
+    record = res.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Metadata '{metadata_id}' not found.")
+
+    conn_res = await db.execute(select(DbConnection).where(DbConnection.metadata_id == meta_uuid))
+    db_conn = conn_res.scalar_one_or_none()
+    if not db_conn:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DB connection not found for this metadata.")
+
+    pwd = decrypt_password(db_conn.encrypted_password)
+
+    # Semaphore: limit concurrent LLM calls to avoid overwhelming Ollama
+    semaphore = asyncio.Semaphore(MAX_LLM_CONCURRENCY)
+
     async def _proc(table_name: str, col: Any):
-        res = await asyncio.to_thread(_execute_discovery_pipeline, table_name, col.column_name, col.data_type, db_conn, pwd, sample_count)
-        return {"table_name": table_name, "column_name": col.column_name, "column_id": str(col.id), "is_pii": res["top_category"] != "not_pii", "category": res["top_category"]}
-    tasks = [ _proc(t.table_name, c) for t in record.tables for c in t.columns ]
+        async with semaphore:
+            res = await asyncio.to_thread(
+                _execute_discovery_pipeline,
+                table_name, col.column_name, col.data_type, db_conn, pwd, sample_count
+            )
+        return {
+            "table_name": table_name,
+            "column_name": col.column_name,
+            "column_id": str(col.id),
+            "is_pii": res["top_category"] != "not_pii",
+            "category": res["top_category"],
+        }
+
+    tasks = [_proc(t.table_name, c) for t in record.tables for c in t.columns]
     all_res = await asyncio.gather(*tasks)
-    tables_map = {}
+
+    tables_map: dict = {}
     for r in all_res:
         tn = r["table_name"]
-        if tn not in tables_map: tables_map[tn] = {"table_name": tn, "pii_count": 0, "columns": []}
+        if tn not in tables_map:
+            tables_map[tn] = {"table_name": tn, "pii_count": 0, "columns": []}
         tables_map[tn]["columns"].append(r)
-        if r["is_pii"]: tables_map[tn]["pii_count"] += 1
-    return {"metadata_id": metadata_id, "database_name": record.database_name, "total_columns": len(all_res), "pii_columns": sum(1 for r in all_res if r["is_pii"]), "tables": sorted(tables_map.values(), key=lambda x: x["table_name"])}
+        if r["is_pii"]:
+            tables_map[tn]["pii_count"] += 1
+
+    return {
+        "metadata_id": metadata_id,
+        "database_name": record.database_name,
+        "total_columns": len(all_res),
+        "pii_columns": sum(1 for r in all_res if r["is_pii"]),
+        "tables": sorted(tables_map.values(), key=lambda x: x["table_name"]),
+    }
 
 async def classify_column(db: AsyncSession, column_id: str, sample_count: int = 10) -> Any:
-    # Included for completeness but most calls go through discover_metadata
-    result = await db.execute(select(ColumnInfo).options(selectinload(ColumnInfo.table)).where(ColumnInfo.id == uuid.UUID(column_id)))
+    import asyncio
+
+    # UUID validation
+    try:
+        col_uuid = uuid.UUID(column_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid column_id: '{column_id}' is not a valid UUID.",
+        )
+
+    result = await db.execute(
+        select(ColumnInfo).options(selectinload(ColumnInfo.table)).where(ColumnInfo.id == col_uuid)
+    )
     col_obj = result.scalar_one_or_none()
-    if not col_obj: raise HTTPException(status_code=404)
+    if not col_obj:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Column '{column_id}' not found.")
+
     conn_res = await db.execute(select(DbConnection).where(DbConnection.metadata_id == col_obj.metadata_id))
     db_conn = conn_res.scalar_one_or_none()
-    import asyncio
-    res = await asyncio.to_thread(_execute_discovery_pipeline, col_obj.table.table_name, col_obj.column_name, col_obj.data_type, db_conn, decrypt_password(db_conn.encrypted_password), sample_count)
-    return {"column_id": column_id, "column_name": col_obj.column_name, "table_name": col_obj.table.table_name, "data_type": col_obj.data_type, **res}
+    if not db_conn:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DB connection not found for this column.")
+
+    res = await asyncio.to_thread(
+        _execute_discovery_pipeline,
+        col_obj.table.table_name, col_obj.column_name, col_obj.data_type,
+        db_conn, decrypt_password(db_conn.encrypted_password), sample_count,
+    )
+    return {
+        "column_id": column_id,
+        "column_name": col_obj.column_name,
+        "table_name": col_obj.table.table_name,
+        "data_type": col_obj.data_type,
+        **res,
+    }

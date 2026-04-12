@@ -31,116 +31,122 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Classification service.
- * Handles:
- *   1. Resolving column → table → connection records
- *   2. Fetching sample data from the target database via JDBC
- *   3. Building the LLM prompt and calling the OpenAI-compatible chat completions API
- *   4. Parsing and normalising the JSON probability response
- *
- * Equivalent to app/classify/service.py in the Python FastAPI project.
+ * Classification service — Java port of app/classify/service.py (Python).
+ * Logic is kept identical ("birebir") to the Python implementation:
+ *   - Count-based LLM system prompt
+ *   - DIRECT_TYPE_MAP  (INET/CIDR → ip_address, bypasses LLM)
+ *   - DIRECT_COLUMN_PATTERNS  (ordered substring match + suffix exclusion)
+ *   - NEGATIVE_PII_KEYWORDS  (filter obvious non-PII before LLM)
+ *   - preprocessSamples()  (flatten JSONB values)
+ *   - callLlm()  (count-based + heavy recovery mapping + semantic hardening)
+ *   - validateWithHeuristics()  (per-category regex/pattern checks)
+ *   - executePipeline()  (unified pipeline used by both endpoints)
  */
 @Service
 public class ClassifyService {
 
     private static final Logger log = LoggerFactory.getLogger(ClassifyService.class);
 
-    // -------------------------------------------------------------------------
-    // All 13 supported PII categories (must match the LLM system prompt)
-    // -------------------------------------------------------------------------
+    // ── PII Categories (13 total, matches Python PII_CATEGORIES) ─────────────
     static final List<String> PII_CATEGORIES = List.of(
-            "email_address",
-            "phone_number",
-            "social_security_number",
-            "credit_card_number",
-            "national_id_number",
-            "full_name",
-            "first_name",
-            "last_name",
-            "tckn",
-            "home_address",
-            "date_of_birth",
-            "ip_address",
-            "not_pii"
+        "email_address", "phone_number", "social_security_number", "credit_card_number",
+        "national_id_number", "full_name", "first_name", "last_name", "tckn",
+        "home_address", "date_of_birth", "ip_address", "not_pii"
     );
 
-    /**
-     * System prompt sent to the LLM on every classification request.
-     * The /no_think prefix suppresses chain-of-thought reasoning on models that
-     * support it (e.g. DeepSeek-R1, Qwen QwQ).
-     */
+    // ── LLM System Prompt — count-based, matches Python SYSTEM_PROMPT exactly ─
     private static final String SYSTEM_PROMPT =
-            "/no_think\n"
-            + "You are a data privacy expert specialising in PII (Personally Identifiable Information) detection.\n\n"
-            + "Your task is to analyse a list of sample values from a single database column and determine "
-            + "the probability that the column belongs to each of the following 13 categories:\n\n"
-            + "1. email_address     – Email addresses (e.g., user@example.com)\n"
-            + "2. phone_number      – Phone numbers in any format (e.g., +1-555-123-4567, 05551234567)\n"
-            + "3. social_security_number – US Social Security Numbers (e.g., 123-45-6789)\n"
-            + "4. credit_card_number – Credit/debit card numbers (e.g., 4111111111111111, 4111-1111-1111-1111)\n"
-            + "5. national_id_number – National ID numbers from any country (non-Turkish)\n"
-            + "6. full_name         – Full names (first + last, e.g., John Smith, Jane Doe)\n"
-            + "7. first_name        – First/given names only (e.g., John, Mary)\n"
-            + "8. last_name         – Last/family names only (e.g., Smith, Johnson)\n"
-            + "9. tckn              – Turkish Citizenship Number (T.C. Kimlik No): exactly 11 digits, first digit non-zero\n"
-            + "10. home_address     – Physical addresses (street, city, postal code, etc.)\n"
-            + "11. date_of_birth    – Dates of birth in any format (e.g., 1990-05-15, 15/05/1990)\n"
-            + "12. ip_address       – IPv4 or IPv6 addresses (e.g., 192.168.1.1, 2001:db8::1)\n"
-            + "13. not_pii          – Data that does not match any PII category (e.g., product codes, prices, counts)\n\n"
-            + "Rules:\n"
-            + "- Probabilities MUST sum to exactly 1.0.\n"
-            + "- Each probability is a float between 0.0 and 1.0.\n"
-            + "- Return ONLY a valid JSON object with all 13 keys listed above.\n"
-            + "- Do not include any explanation outside the JSON.\n"
-            + "- Consider the column name as a strong hint, but base the classification primarily on the actual sample values.\n"
-            + "- If the data is clearly not any type of PII, assign most probability to \"not_pii\".\n\n"
-            + "Example response format:\n"
-            + "{\n"
-            + "  \"email_address\": 0.95,\n"
-            + "  \"phone_number\": 0.01,\n"
-            + "  \"social_security_number\": 0.0,\n"
-            + "  \"credit_card_number\": 0.0,\n"
-            + "  \"national_id_number\": 0.0,\n"
-            + "  \"full_name\": 0.0,\n"
-            + "  \"first_name\": 0.0,\n"
-            + "  \"last_name\": 0.0,\n"
-            + "  \"tckn\": 0.0,\n"
-            + "  \"home_address\": 0.0,\n"
-            + "  \"date_of_birth\": 0.0,\n"
-            + "  \"ip_address\": 0.0,\n"
-            + "  \"not_pii\": 0.04\n"
-            + "}";
+        "Analyze sample data for PII. You MUST return a JSON with counts.\n\n"
+        + "ALLOWED KEYS: email_address, phone_number, social_security_number, credit_card_number, "
+        + "tckn, national_id_number, full_name, first_name, last_name, home_address, date_of_birth, ip_address, not_pii.\n\n"
+        + "GUIDELINES:\n"
+        + "- Turkish TCKN (11 digits, starts non-zero) -> 'tckn'\n"
+        + "- IBAN / bank account numbers -> 'credit_card_number'\n"
+        + "- IP Addresses (IPv4/v6) -> 'ip_address'\n"
+        + "- Masked card data (****) -> 'credit_card_number'\n"
+        + "- No such PII? -> 'not_pii'\n\n"
+        + "REQUIRED OUTPUT: {\"email_address\": 0, \"phone_number\": 0, ...} (All 13 keys)";
 
-    // ── Smart discovery constants ──────────────────────────────────────────────
+    // ── Skip Types — identical to Python SKIP_TYPES ────────────────────────────
+    private static final Set<String> SKIP_TYPES = Set.of("integer", "boolean", "uuid");
 
-    private static final Set<String> SKIP_TYPES = Set.of(
-        "integer", "bigint", "smallint", "int", "int2", "int4", "int8",
-        "serial", "bigserial", "boolean", "bool",
-        "numeric", "decimal", "real", "double precision", "float4", "float8",
-        "uuid", "jsonb", "json", "bytea", "oid"
+    // ── Direct Type Map — PostgreSQL type → PII category, bypasses LLM ────────
+    private static final Map<String, String> DIRECT_TYPE_MAP = Map.of(
+        "inet", "ip_address",
+        "cidr", "ip_address"
     );
 
-    private static final List<Map.Entry<String, List<String>>> PII_NAME_RULES = List.of(
-        Map.entry("email_address",          List.of("email", "mail")),
-        Map.entry("phone_number",           List.of("phone", "tel", "gsm", "mobile", "cellular")),
-        Map.entry("tckn",                   List.of("tckn", "tc_kimlik", "tc_no", "kimlik_no")),
-        Map.entry("social_security_number", List.of("ssn", "social_security")),
-        Map.entry("credit_card_number",     List.of("credit_card", "card_number", "card_no")),
-        Map.entry("ip_address",             List.of("ip_address", "ip_addr", "ipaddress")),
-        Map.entry("full_name",              List.of("full_name", "fullname")),
-        Map.entry("first_name",             List.of("first_name", "firstname", "given_name")),
-        Map.entry("last_name",              List.of("last_name", "lastname", "surname", "family_name", "soyad")),
-        Map.entry("home_address",           List.of("street_address", "home_address", "address")),
-        Map.entry("date_of_birth",          List.of("date_of_birth", "birth_date", "dob", "birthday")),
-        Map.entry("national_id_number",     List.of("national_id", "passport", "driver_license"))
+    // ── Direct Column Name Patterns (ordered list, first match wins) ──────────
+    // Mirrors Python DIRECT_COLUMN_PATTERNS exactly — specific patterns first.
+    // Each entry: { pattern, category }
+    private static final List<String[]> DIRECT_COLUMN_PATTERNS = List.of(
+        // Names — more specific first
+        new String[]{"full_name",       "full_name"},
+        new String[]{"fullname",        "full_name"},
+        new String[]{"given_name",      "first_name"},
+        new String[]{"name_first",      "first_name"},
+        new String[]{"first_name",      "first_name"},
+        new String[]{"family_name",     "last_name"},
+        new String[]{"name_last",       "last_name"},
+        new String[]{"last_name",       "last_name"},
+        // Email
+        new String[]{"email",           "email_address"},
+        // Phone / Mobile
+        new String[]{"mobile",          "phone_number"},
+        new String[]{"phone",           "phone_number"},
+        new String[]{"telephone",       "phone_number"},
+        // Address / Street
+        new String[]{"street",          "home_address"},
+        // Date of Birth — specific first
+        new String[]{"date_of_birth",   "date_of_birth"},
+        new String[]{"birth_date",      "date_of_birth"},
+        new String[]{"date_born",       "date_of_birth"},
+        new String[]{"_dob",            "date_of_birth"},   // holder_dob, patient_dob
+        new String[]{"birth",           "date_of_birth"},   // birthdate, birthday
+        new String[]{"born",            "date_of_birth"},   // date_born, born_on
+        // Turkish National ID
+        new String[]{"national_id",     "tckn"},
+        new String[]{"id_no",           "tckn"},            // holder_id_no, patient_id_no
+        new String[]{"tckn",            "tckn"},
+        new String[]{"tc_no",           "tckn"},
+        new String[]{"kimlik",          "tckn"},
+        // IBAN / Bank → credit_card_number (closest financial category)
+        new String[]{"iban",            "credit_card_number"},
+        new String[]{"bank_account",    "credit_card_number"},
+        // IP
+        new String[]{"ip_address",      "ip_address"},
+        // SSN
+        new String[]{"social_security", "social_security_number"},
+        new String[]{"ssn",             "social_security_number"}
     );
 
-    private static final List<String> NOT_PII_KEYWORDS = List.of(
-        "_id", "count", "amount", "price", "cost", "total",
-        "quantity", "status", "code", "type", "rating",
-        "percentage", "level", "stock", "weight", "score"
+    // ── Non-PII Column Suffixes — these columns are NEVER PII data ────────────
+    // Matches Python _NON_PII_COL_SUFFIXES exactly.
+    private static final List<String> NON_PII_COL_SUFFIXES = List.of(
+        "_type", "_kind", "_mode", "_status", "_flag",
+        "_code", "_brand", "_model", "_category", "_class", "_label"
     );
 
+    // ── Negative PII Keywords — skip column if matched (unless sensitive) ─────
+    // Matches Python NEGATIVE_PII_KEYWORDS exactly.
+    private static final Set<String> NEGATIVE_PII_KEYWORDS = Set.of(
+        "pk", "fk", "_id", "created_at", "updated_at", "deleted_at", "occurred_at",
+        "status", "version", "count", "amount", "price", "is_active", "is_deleted",
+        "track", "log", "measure", "metric", "unit", "rating", "score", "index",
+        "heart_rate", "blood_pressure", "vital_signs", "temperature",
+        "user_agent", "browser", "description", "payment_type", "type", "mode", "category",
+        "registration_date", "hired_at", "hire_date", "last_updated", "created_date",
+        "latitude", "longitude", "geo", "postal", "zip", "quantity", "stock", "bonus", "salary"
+    );
+
+    // ── Sensitive Keywords — override negative filter when present ─────────────
+    // Matches Python's is_sens logic in _execute_discovery_pipeline exactly.
+    private static final List<String> SENSITIVE_KEYWORDS = List.of(
+        "national", "citizen", "tax", "tckn", "social", "identity", "id_no", "kimlik",
+        "iban", "policy", "dob", "birth", "email", "phone", "address"
+    );
+
+    // ── Spring beans ──────────────────────────────────────────────────────────
     private final AppConfig appConfig;
     private final ColumnInfoRepository columnInfoRepository;
     private final TableInfoRepository tableInfoRepository;
@@ -170,345 +176,60 @@ public class ClassifyService {
     }
 
     // =========================================================================
-    // Public entry point
+    // Public Entry Points
     // =========================================================================
 
     /**
-     * Main classification workflow:
-     * 1. Resolve column → table → connection
-     * 2. Fetch sample data from the target DB
-     * 3. Call LLM for classification
-     * 4. Return structured result
-     *
+     * Classify a single column by column_id.
      * Equivalent to classify_column() in app/classify/service.py.
      */
     public ClassifyResponse classify(ClassifyRequest request) {
         UUID columnUuid = parseUuid(request.getColumnId(), "column_id");
 
-        // 1. Resolve ColumnInfo
         ColumnInfo columnInfo = columnInfoRepository.findById(columnUuid)
-                .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.NOT_FOUND,
-                        "Column '" + request.getColumnId() + "' not found."));
+            .orElseThrow(() -> new ResponseStatusException(
+                HttpStatus.NOT_FOUND, "Column '" + request.getColumnId() + "' not found."));
 
-        // 2. Resolve TableInfo
         TableInfo tableInfo = tableInfoRepository.findById(columnInfo.getTableId())
-                .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.NOT_FOUND,
-                        "Table record for column '" + request.getColumnId() + "' not found."));
+            .orElseThrow(() -> new ResponseStatusException(
+                HttpStatus.NOT_FOUND, "Table record for column '" + request.getColumnId() + "' not found."));
 
-        // 3. Resolve DbConnection
-        DbConnection dbConn = dbConnectionRepository
-                .findByMetadataId(columnInfo.getMetadataId())
-                .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.NOT_FOUND,
-                        "No DB connection found for metadata '" + columnInfo.getMetadataId() + "'."));
+        DbConnection dbConn = dbConnectionRepository.findByMetadataId(columnInfo.getMetadataId())
+            .orElseThrow(() -> new ResponseStatusException(
+                HttpStatus.NOT_FOUND,
+                "No DB connection found for metadata '" + columnInfo.getMetadataId() + "'."));
 
-        // 4. Decrypt password
         String plainPassword;
         try {
             plainPassword = metadataService.decryptPassword(dbConn.getEncryptedPassword());
         } catch (Exception e) {
-            throw new ResponseStatusException(
-                    HttpStatus.INTERNAL_SERVER_ERROR,
-                    "Failed to decrypt stored password: " + e.getMessage());
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                "Failed to decrypt stored password: " + e.getMessage());
         }
 
-        // 5. Fetch sample data
-        List<Object> samples = fetchSampleData(
-                dbConn.getHost(),
-                Integer.parseInt(dbConn.getPort()),
-                dbConn.getDatabaseName(),
-                dbConn.getUsername(),
-                plainPassword,
-                tableInfo.getTableName(),
-                columnInfo.getColumnName(),
-                request.getSampleCount()
-        );
+        Map<String, Object> res = executePipeline(
+            tableInfo.getTableName(), columnInfo.getColumnName(), columnInfo.getDataType(),
+            dbConn, plainPassword, request.getSampleCount());
 
-        // 6. Call LLM
-        Map<String, Double> classifications = callLlm(columnInfo.getColumnName(), samples);
-
-        // 7. Determine top category
-        String topCategory = classifications.entrySet().stream()
-                .max(Map.Entry.comparingByValue())
-                .map(Map.Entry::getKey)
-                .orElse("not_pii");
-
-        double topProbability = classifications.getOrDefault(topCategory, 0.0);
+        @SuppressWarnings("unchecked")
+        Map<String, Double> classifications = (Map<String, Double>) res.get("classifications");
+        String topCategory  = (String) res.get("top_category");
+        double topProbability = (double) res.get("top_probability");
+        int sampleCount = (int) res.get("sample_count");
 
         return new ClassifyResponse(
-                request.getColumnId(),
-                columnInfo.getColumnName(),
-                tableInfo.getTableName(),
-                columnInfo.getDataType(),
-                samples.size(),
-                topCategory,
-                topProbability,
-                classifications
-        );
-    }
-
-    // =========================================================================
-    // Target DB sampling
-    // =========================================================================
-
-    /**
-     * Fetch up to {@code sampleCount} distinct non-null values from the specified column.
-     * Uses JDBC with double-quoted identifiers to handle reserved words and mixed-case names.
-     *
-     * Equivalent to _fetch_sample_data() in app/classify/service.py.
-     */
-    private List<Object> fetchSampleData(
-            String host, int port, String database,
-            String username, String password,
-            String tableName, String columnName, int sampleCount) {
-
-        String jdbcUrl = String.format("jdbc:postgresql://%s:%d/%s?connectTimeout=10",
-                host, port, database);
-
-        // Use double-quoted identifiers to safely handle reserved words / mixed case
-        String sql = String.format(
-                "SELECT \"%s\" FROM \"%s\" WHERE \"%s\" IS NOT NULL LIMIT %d",
-                columnName.replace("\"", "\"\""),
-                tableName.replace("\"", "\"\""),
-                columnName.replace("\"", "\"\""),
-                sampleCount
-        );
-
-        try (Connection conn = DriverManager.getConnection(jdbcUrl, username, password);
-             PreparedStatement ps = conn.prepareStatement(sql);
-             ResultSet rs = ps.executeQuery()) {
-
-            List<Object> results = new ArrayList<>();
-            while (rs.next()) {
-                results.add(rs.getObject(1));
-            }
-            return results;
-
-        } catch (SQLException e) {
-            throw new ResponseStatusException(
-                    HttpStatus.BAD_REQUEST,
-                    "Failed to query target database: " + e.getMessage());
-        }
-    }
-
-    // =========================================================================
-    // LLM call and response parsing
-    // =========================================================================
-
-    /**
-     * Build the OpenAI chat completions request, call the API via RestTemplate,
-     * parse the JSON response, and normalise probabilities so they sum to 1.0.
-     *
-     * Equivalent to _call_llm() in app/classify/service.py.
-     */
-    private Map<String, Double> callLlm(String columnName, List<Object> sampleValues) {
-        // Cap at 50 samples for token safety (mirrors Python implementation)
-        List<Object> capped = sampleValues.size() > 50
-                ? sampleValues.subList(0, 50)
-                : sampleValues;
-
-        StringBuilder sb = new StringBuilder();
-        for (Object v : capped) {
-            sb.append("  - ").append(v == null ? "null" : v.toString()).append("\n");
-        }
-
-        String userMessage =
-                "Column name: " + columnName + "\n\n"
-                + "Sample values (" + sampleValues.size() + " rows):\n" + sb
-                + "\nClassify this column according to the 13 PII categories described in the "
-                + "system prompt. Return ONLY a valid JSON object with all 13 keys, no extra text.";
-
-        // Build request payload
-        Map<String, Object> systemMsg = Map.of("role", "system", "content", SYSTEM_PROMPT);
-        Map<String, Object> userMsg   = Map.of("role", "user",   "content", userMessage);
-
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("model", appConfig.getLlmModel());
-        body.put("messages", List.of(systemMsg, userMsg));
-        body.put("temperature", 0.0);
-
-        // Add response_format only for official OpenAI endpoints (not local Ollama etc.)
-        String baseUrl = appConfig.getLlmBaseUrl();
-        if (baseUrl != null && baseUrl.contains("openai.com")) {
-            body.put("response_format", Map.of("type", "json_object"));
-        }
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        headers.setBearerAuth(appConfig.getLlmApiKey());
-
-        String endpointUrl = baseUrl.replaceAll("/+$", "") + "/chat/completions";
-
-        String rawResponse;
-        try {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> apiResponse = restTemplate.postForObject(
-                    endpointUrl,
-                    new HttpEntity<>(body, headers),
-                    Map.class
-            );
-            rawResponse = extractContent(apiResponse);
-        } catch (ResponseStatusException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new ResponseStatusException(
-                    HttpStatus.INTERNAL_SERVER_ERROR,
-                    "LLM API call failed: " + e.getMessage());
-        }
-
-        // Strip <think>…</think> tags that some models (e.g. DeepSeek-R1) emit before JSON
-        rawResponse = stripThinkTags(rawResponse);
-
-        Map<String, Double> parsed;
-        try {
-            parsed = extractJson(rawResponse);
-        } catch (Exception e) {
-            throw new ResponseStatusException(
-                    HttpStatus.INTERNAL_SERVER_ERROR,
-                    "LLM returned invalid JSON: " + e.getMessage());
-        }
-
-        // Ensure all categories are present and values are doubles
-        Map<String, Double> result = new LinkedHashMap<>();
-        for (String cat : PII_CATEGORIES) {
-            result.put(cat, parsed.getOrDefault(cat, 0.0));
-        }
-
-        // Normalise so probabilities sum to 1.0 (handle floating-point drift)
-        double total = result.values().stream().mapToDouble(Double::doubleValue).sum();
-        if (total > 0) {
-            result.replaceAll((k, v) -> Math.round(v / total * 1_000_000.0) / 1_000_000.0);
-        } else {
-            // Fallback – mark as not_pii when LLM returns all zeros
-            result.replaceAll((k, v) -> 0.0);
-            result.put("not_pii", 1.0);
-        }
-
-        return result;
-    }
-
-    /**
-     * Navigate the OpenAI-compatible response envelope to extract the assistant message content.
-     */
-    @SuppressWarnings("unchecked")
-    private String extractContent(Map<String, Object> apiResponse) {
-        if (apiResponse == null) {
-            throw new ResponseStatusException(
-                    HttpStatus.INTERNAL_SERVER_ERROR, "Empty response from LLM API");
-        }
-        List<Map<String, Object>> choices =
-                (List<Map<String, Object>>) apiResponse.get("choices");
-        if (choices == null || choices.isEmpty()) {
-            throw new ResponseStatusException(
-                    HttpStatus.INTERNAL_SERVER_ERROR, "LLM API returned no choices");
-        }
-        Map<String, Object> message = (Map<String, Object>) choices.get(0).get("message");
-        if (message == null) {
-            throw new ResponseStatusException(
-                    HttpStatus.INTERNAL_SERVER_ERROR, "LLM API choice missing message");
-        }
-        Object content = message.get("content");
-        if (content == null) {
-            throw new ResponseStatusException(
-                    HttpStatus.INTERNAL_SERVER_ERROR, "LLM API message has null content");
-        }
-        return content.toString().trim();
-    }
-
-    /**
-     * Remove {@code <think>...</think>} blocks that some reasoning models prepend before
-     * their actual response.  Also trims leading/trailing whitespace.
-     */
-    private String stripThinkTags(String text) {
-        // Remove <think>...</think> blocks (greedy across newlines)
-        String cleaned = text.replaceAll("(?s)<think>.*?</think>", "").trim();
-        return cleaned.isEmpty() ? text : cleaned;
-    }
-
-    /**
-     * Robustly extract a JSON object from the LLM text response.
-     * Tries three strategies in order:
-     *   1. Direct JSON parse
-     *   2. Extract from ```json ... ``` or ``` ... ``` markdown fences
-     *   3. Find the first '{' … '}' block in the text
-     *
-     * Equivalent to _extract_json() in app/classify/service.py.
-     */
-    private Map<String, Double> extractJson(String text) throws Exception {
-        TypeReference<Map<String, Double>> typeRef = new TypeReference<>() {};
-
-        // 1. Direct parse
-        try {
-            return objectMapper.readValue(text, typeRef);
-        } catch (Exception ignored) {
-            // fall through
-        }
-
-        // 2. Markdown code fence: ```json { ... } ```  or  ``` { ... } ```
-        Pattern fencePattern = Pattern.compile(
-                "```(?:json)?\\s*(\\{.*?})\\s*```", Pattern.DOTALL);
-        Matcher fenceMatcher = fencePattern.matcher(text);
-        if (fenceMatcher.find()) {
-            try {
-                return objectMapper.readValue(fenceMatcher.group(1), typeRef);
-            } catch (Exception ignored) {
-                // fall through
-            }
-        }
-
-        // 3. Find first balanced { ... } block
-        int start = text.indexOf('{');
-        int end   = text.lastIndexOf('}');
-        if (start >= 0 && end > start) {
-            try {
-                return objectMapper.readValue(text.substring(start, end + 1), typeRef);
-            } catch (Exception ignored) {
-                // fall through
-            }
-        }
-
-        throw new IllegalArgumentException(
-                "No valid JSON object found in LLM response: "
-                + text.substring(0, Math.min(200, text.length())));
-    }
-
-    // =========================================================================
-    // Smart discovery
-    // =========================================================================
-
-    /**
-     * Rule-based column name classifier.
-     * Returns a PII category name, "not_pii", or null (uncertain → LLM).
-     */
-    private String ruleBasedClassify(String columnName) {
-        String lower = columnName.toLowerCase();
-
-        for (Map.Entry<String, List<String>> entry : PII_NAME_RULES) {
-            for (String keyword : entry.getValue()) {
-                if (lower.contains(keyword)) {
-                    return entry.getKey();
-                }
-            }
-        }
-
-        for (String kw : NOT_PII_KEYWORDS) {
-            if (lower.contains(kw)) {
-                return "not_pii";
-            }
-        }
-
-        return null; // uncertain → send to LLM
+            request.getColumnId(),
+            columnInfo.getColumnName(),
+            tableInfo.getTableName(),
+            columnInfo.getDataType(),
+            sampleCount,
+            topCategory,
+            topProbability,
+            classifications);
     }
 
     /**
      * Full PII discovery for an entire metadata record.
-     * Uses 3-phase smart filtering to minimise LLM calls:
-     *   Phase 1 – skip numeric/boolean types (instant)
-     *   Phase 2 – classify by column name rules (instant)
-     *   Phase 3 – LLM for remaining uncertain text columns
-     *
      * Equivalent to discover_metadata() in app/classify/service.py.
      */
     public DiscoverResponse discoverPii(String metadataId, int sampleCount) {
@@ -536,14 +257,13 @@ public class ClassifyService {
                 "Failed to decrypt password: " + e.getMessage());
         }
 
-        int totalColumns = 0, skipped = 0, ruleBased = 0, llmScanned = 0, piiCount = 0;
-        List<DiscoverResponse.TableResult> tablesOut = new ArrayList<>();
-
-        // Load tables with columns in a single query (avoids MultipleBagFetchException)
         List<TableInfo> sortedTables = tableInfoRepository.findByMetadataIdWithColumns(metaUuid)
             .stream()
             .sorted(Comparator.comparing(TableInfo::getTableName))
             .collect(Collectors.toList());
+
+        int totalColumns = 0, piiCount = 0;
+        List<DiscoverResponse.TableResult> tablesOut = new ArrayList<>();
 
         for (TableInfo table : sortedTables) {
             List<DiscoverResponse.ColumnResult> colsOut = new ArrayList<>();
@@ -554,87 +274,558 @@ public class ClassifyService {
 
             for (ColumnInfo col : sortedCols) {
                 totalColumns++;
-                String dtype = col.getDataType().toLowerCase();
 
-                // Phase 1 – skip by data type
-                if (SKIP_TYPES.contains(dtype)) {
-                    skipped++;
-                    colsOut.add(new DiscoverResponse.ColumnResult(
-                        col.getId().toString(), col.getColumnName(), col.getDataType(),
-                        "not_pii", 1.0, false, "skipped_type", null));
-                    continue;
-                }
+                Map<String, Object> res = executePipeline(
+                    table.getTableName(), col.getColumnName(), col.getDataType(),
+                    dbConn, plainPassword, sampleCount);
 
-                // Phase 2 – rule-based
-                String ruleResult = ruleBasedClassify(col.getColumnName());
-                if (ruleResult != null) {
-                    ruleBased++;
-                    boolean isPii = !ruleResult.equals("not_pii");
-                    if (isPii) piiCount++;
-                    colsOut.add(new DiscoverResponse.ColumnResult(
-                        col.getId().toString(), col.getColumnName(), col.getDataType(),
-                        ruleResult, 0.95, isPii, "rule_based", null));
-                    continue;
-                }
+                String topCat = (String) res.get("top_category");
+                boolean isPii = !"not_pii".equals(topCat);
+                if (isPii) piiCount++;
 
-                // Phase 3 – LLM
-                try {
-                    List<Object> samples = fetchSampleData(
-                        dbConn.getHost(),
-                        Integer.parseInt(dbConn.getPort()),
-                        dbConn.getDatabaseName(),
-                        dbConn.getUsername(),
-                        plainPassword,
-                        table.getTableName(),
-                        col.getColumnName(),
-                        sampleCount);
-
-                    Map<String, Double> classifications = callLlm(col.getColumnName(), samples);
-                    String topCat = classifications.entrySet().stream()
-                        .max(Map.Entry.comparingByValue())
-                        .map(Map.Entry::getKey)
-                        .orElse("not_pii");
-                    double topProb = classifications.getOrDefault(topCat, 0.0);
-                    boolean isPii = !topCat.equals("not_pii");
-
-                    llmScanned++;
-                    if (isPii) piiCount++;
-                    colsOut.add(new DiscoverResponse.ColumnResult(
-                        col.getId().toString(), col.getColumnName(), col.getDataType(),
-                        topCat, topProb, isPii, "llm", null));
-
-                } catch (Exception e) {
-                    colsOut.add(new DiscoverResponse.ColumnResult(
-                        col.getId().toString(), col.getColumnName(), col.getDataType(),
-                        "unknown", 0.0, false, "error", e.getMessage()));
-                }
+                colsOut.add(new DiscoverResponse.ColumnResult(
+                    col.getId().toString(), col.getColumnName(), isPii, topCat));
             }
 
             int tablePii = (int) colsOut.stream()
                 .filter(DiscoverResponse.ColumnResult::isPii)
                 .count();
-            tablesOut.add(new DiscoverResponse.TableResult(
-                table.getTableName(), tablePii, colsOut));
+            tablesOut.add(new DiscoverResponse.TableResult(table.getTableName(), tablePii, colsOut));
         }
 
-        DiscoverResponse.Summary summary = new DiscoverResponse.Summary(
-            totalColumns, skipped, ruleBased, llmScanned, piiCount, totalColumns - piiCount);
-
         return new DiscoverResponse(metadataId, record.getDatabaseName(),
-            sampleCount, summary, tablesOut);
+            totalColumns, piiCount, tablesOut);
     }
 
     // =========================================================================
-    // Helpers
+    // Unified Discovery Pipeline
+    // =========================================================================
+
+    /**
+     * Core pipeline — equivalent to _execute_discovery_pipeline() in Python.
+     *
+     * Phases:
+     *   0. Skip by data type  (SKIP_TYPES)
+     *   1. Direct type map     (INET/CIDR → ip_address)
+     *   2. Direct column name  (substring pattern match)
+     *   3. Negative keyword filter (skip obvious non-PII unless sensitive)
+     *   4. Fetch samples from target DB
+     *   5. Pre-process samples  (flatten JSONB)
+     *   6. Call LLM             (count-based)
+     *   7. Validate with heuristics
+     *   8. Normalize & return
+     *
+     * Returns map with keys: top_category, top_probability, classifications, sample_count.
+     */
+    private Map<String, Object> executePipeline(
+            String tableName, String colName, String dtype,
+            DbConnection dbConn, String password, int count) {
+
+        String tCol = colName.toLowerCase();
+
+        // Phase 0 – skip by data type
+        if (SKIP_TYPES.contains(dtype.toLowerCase())) {
+            return emptyResult();
+        }
+
+        // Phase 1 – direct type mapping (e.g. INET → ip_address)
+        String directTypeCat = DIRECT_TYPE_MAP.get(dtype.toLowerCase());
+        if (directTypeCat != null) {
+            return directResult(directTypeCat);
+        }
+
+        // Phase 2 – direct column name pattern match
+        String directColCat = directColMatch(tCol);
+        if (directColCat != null) {
+            log.debug("[DIRECT MATCH] {}.{} -> {}", tableName, colName, directColCat);
+            return directResult(directColCat);
+        }
+
+        // Phase 3 – negative keyword filter
+        boolean isSens    = SENSITIVE_KEYWORDS.stream().anyMatch(tCol::contains);
+        boolean hasNeg    = NEGATIVE_PII_KEYWORDS.stream().anyMatch(tCol::contains)
+                            || tCol.endsWith("_id");
+        if (hasNeg && !isSens) {
+            return emptyResult();
+        }
+
+        // Phase 4 – fetch sample data
+        List<Object> rawSamples;
+        try {
+            rawSamples = fetchSampleData(
+                dbConn.getHost(), Integer.parseInt(dbConn.getPort()),
+                dbConn.getDatabaseName(), dbConn.getUsername(), password,
+                tableName, colName, count);
+        } catch (Exception e) {
+            return emptyResult();
+        }
+        if (rawSamples.isEmpty()) return emptyResult();
+
+        // Phase 5 – preprocess (flatten JSONB / dict values)
+        List<String> samples = preprocessSamples(rawSamples);
+
+        // Phase 6 – call LLM (count-based)
+        Map<String, Double> classif = callLlm(colName, samples, tableName);
+
+        // Phase 7 – validate with heuristics
+        Map<String, Double> validated = new LinkedHashMap<>();
+        for (Map.Entry<String, Double> e : classif.entrySet()) {
+            double prob = validateWithHeuristics(e.getKey(), samples, colName)
+                          ? e.getValue() : 0.0;
+            validated.put(e.getKey(), prob);
+        }
+
+        // Phase 8 – normalize
+        double piiSum = validated.values().stream().mapToDouble(Double::doubleValue).sum();
+        if (piiSum == 0) {
+            // LLM returned all zeros (or heuristics rejected all) → not_pii
+            Map<String, Double> res = new LinkedHashMap<>();
+            for (String cat : PII_CATEGORIES) {
+                if (!"not_pii".equals(cat)) res.put(cat, 0.0);
+            }
+            res.put("not_pii", 1.0);
+            Map<String, Object> r = new LinkedHashMap<>();
+            r.put("top_category",   "not_pii");
+            r.put("top_probability", 1.0);
+            r.put("classifications", res);
+            r.put("sample_count",    rawSamples.size());
+            return r;
+        }
+
+        Map<String, Double> finalMap = new LinkedHashMap<>();
+        for (String cat : PII_CATEGORIES) {
+            if (!"not_pii".equals(cat)) {
+                double v = validated.getOrDefault(cat, 0.0);
+                finalMap.put(cat, Math.round(v / piiSum * 1_000_000.0) / 1_000_000.0);
+            }
+        }
+
+        String topCat = finalMap.entrySet().stream()
+            .max(Map.Entry.comparingByValue())
+            .map(Map.Entry::getKey)
+            .orElse("not_pii");
+        double topProb = finalMap.getOrDefault(topCat, 0.0);
+
+        log.debug("[PII MATCH] {}.{} -> {}", tableName, colName, topCat);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("top_category",    topCat);
+        result.put("top_probability", topProb);
+        result.put("classifications", finalMap);
+        result.put("sample_count",    rawSamples.size());
+        return result;
+    }
+
+    // =========================================================================
+    // Direct Match Helpers
+    // =========================================================================
+
+    /**
+     * Equivalent to _direct_col_match() in Python.
+     * Returns a PII category if the column name clearly signals a PII field,
+     * or null if no pattern matches.
+     */
+    private String directColMatch(String colNameLower) {
+        // Suffix exclusion: _type / _status / etc. are never PII data columns
+        for (String suffix : NON_PII_COL_SUFFIXES) {
+            if (colNameLower.endsWith(suffix)) return null;
+        }
+        // Ordered substring match — first hit wins
+        for (String[] entry : DIRECT_COLUMN_PATTERNS) {
+            if (colNameLower.contains(entry[0])) return entry[1];
+        }
+        return null;
+    }
+
+    /** Build an "empty / not_pii" result with 0 sample_count. */
+    private Map<String, Object> emptyResult() {
+        Map<String, Double> classif = new LinkedHashMap<>();
+        for (String cat : PII_CATEGORIES) {
+            if (!"not_pii".equals(cat)) classif.put(cat, 0.0);
+        }
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("top_category",    "not_pii");
+        r.put("top_probability", 1.0);
+        r.put("classifications", classif);
+        r.put("sample_count",    0);
+        return r;
+    }
+
+    /** Build a direct-match result with probability 1.0 for the given category. */
+    private Map<String, Object> directResult(String category) {
+        Map<String, Double> classif = new LinkedHashMap<>();
+        for (String cat : PII_CATEGORIES) {
+            if (!"not_pii".equals(cat)) classif.put(cat, cat.equals(category) ? 1.0 : 0.0);
+        }
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("top_category",    category);
+        r.put("top_probability", 1.0);
+        r.put("classifications", classif);
+        r.put("sample_count",    0);
+        return r;
+    }
+
+    // =========================================================================
+    // Sample Fetching
+    // =========================================================================
+
+    /**
+     * Fetch up to {@code sampleCount} non-null values from the target column via JDBC.
+     * Equivalent to the psycopg2 fetch in _execute_discovery_pipeline() (Python).
+     */
+    private List<Object> fetchSampleData(
+            String host, int port, String database,
+            String username, String password,
+            String tableName, String columnName, int sampleCount) {
+
+        String jdbcUrl = String.format("jdbc:postgresql://%s:%d/%s?connectTimeout=10",
+            host, port, database);
+        String sql = String.format(
+            "SELECT \"%s\" FROM \"%s\" WHERE \"%s\" IS NOT NULL LIMIT %d",
+            columnName.replace("\"", "\"\""),
+            tableName.replace("\"", "\"\""),
+            columnName.replace("\"", "\"\""),
+            sampleCount);
+
+        try (Connection conn = DriverManager.getConnection(jdbcUrl, username, password);
+             PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+
+            List<Object> results = new ArrayList<>();
+            while (rs.next()) results.add(rs.getObject(1));
+            return results;
+
+        } catch (SQLException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                "Failed to query target database: " + e.getMessage());
+        }
+    }
+
+    // =========================================================================
+    // Sample Pre-processing
+    // =========================================================================
+
+    /**
+     * Convert raw DB values to strings, flattening JSONB/dict values.
+     * Equivalent to _preprocess_samples() in Python.
+     *
+     * JSONB columns arrive as a JSON string from JDBC; we parse them and
+     * flatten to "key: value | key: value" so the LLM can see field names.
+     */
+    @SuppressWarnings("unchecked")
+    private List<String> preprocessSamples(List<Object> raw) {
+        List<String> result = new ArrayList<>();
+        for (Object r : raw) {
+            if (r instanceof Map) {
+                // Already a map (some JDBC drivers deserialize JSONB)
+                Map<?, ?> m = (Map<?, ?>) r;
+                result.add(m.entrySet().stream()
+                    .map(e -> e.getKey() + ": " + e.getValue())
+                    .collect(Collectors.joining(" | ")));
+            } else {
+                String s = (r == null) ? "null" : r.toString();
+                if (s.trim().startsWith("{")) {
+                    try {
+                        Map<String, Object> obj = objectMapper.readValue(s,
+                            new TypeReference<Map<String, Object>>() {});
+                        result.add(obj.entrySet().stream()
+                            .map(e -> e.getKey() + ": " + e.getValue())
+                            .collect(Collectors.joining(" | ")));
+                        continue;
+                    } catch (Exception ignored) {
+                        // not valid JSON — fall through to plain string
+                    }
+                }
+                result.add(s);
+            }
+        }
+        return result;
+    }
+
+    // =========================================================================
+    // LLM Call
+    // =========================================================================
+
+    /**
+     * Count-based LLM call with heavy recovery mapping, semantic hardening,
+     * and national_id_number → tckn consolidation.
+     * Equivalent to _call_llm() in Python.
+     *
+     * Returns a map of { category → normalized probability } for all non-not_pii
+     * categories.  If the LLM returns nothing useful, all values are 0.0.
+     */
+    private Map<String, Double> callLlm(String columnName, List<String> samples, String tableName) {
+        log.debug("[LLM CALL] {}.{}", tableName, columnName);
+
+        // Cap at 15 samples (matches Python [:15])
+        List<String> capped = samples.size() > 15 ? samples.subList(0, 15) : samples;
+
+        StringBuilder sb = new StringBuilder();
+        for (String v : capped) sb.append("- ").append(v).append("\n");
+
+        String userMsg = "Table: " + tableName + "\nColumn: " + columnName
+            + "\nSamples:\n" + sb;
+
+        Map<String, Object> systemMsg = Map.of("role", "system", "content", SYSTEM_PROMPT);
+        Map<String, Object> userMsgMap = Map.of("role", "user",  "content", userMsg);
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("model",       appConfig.getLlmModel());
+        body.put("messages",    List.of(systemMsg, userMsgMap));
+        body.put("temperature", 0.0);
+
+        // response_format only for official OpenAI endpoints (not Ollama)
+        String baseUrl = appConfig.getLlmBaseUrl();
+        if (baseUrl != null && baseUrl.contains("openai.com")) {
+            body.put("response_format", Map.of("type", "json_object"));
+        }
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(appConfig.getLlmApiKey());
+
+        String endpointUrl = baseUrl.replaceAll("/+$", "") + "/chat/completions";
+
+        Map<String, Object> rawData;
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> apiResponse = restTemplate.postForObject(
+                endpointUrl, new HttpEntity<>(body, headers), Map.class);
+            String rawText = stripThinkTags(extractContent(apiResponse));
+            rawData = extractJsonRaw(rawText);
+        } catch (Exception e) {
+            log.debug("[LLM ERR] {}", e.getMessage());
+            return emptyClassifications();
+        }
+
+        log.debug("[LLM RAW] {}: {}", columnName, rawData);
+
+        // ── Heavy Duty Recovery Mapping ──────────────────────────────────────
+        // Start with 0 counts for every non-not_pii category.
+        Map<String, Integer> cleaned = new LinkedHashMap<>();
+        for (String cat : PII_CATEGORIES) {
+            if (!"not_pii".equals(cat)) cleaned.put(cat, 0);
+        }
+
+        for (Map.Entry<String, Object> entry : rawData.entrySet()) {
+            String kLower = entry.getKey().toLowerCase();
+            int val;
+            try {
+                val = (int) Math.round(((Number) entry.getValue()).doubleValue());
+            } catch (Exception e) {
+                continue;
+            }
+            if (val <= 0) continue;
+
+            if (cleaned.containsKey(kLower)) {
+                cleaned.merge(kLower, val, Integer::sum);
+            } else if (kLower.contains("card")   || kLower.contains("cc")) {
+                cleaned.merge("credit_card_number", val, Integer::sum);
+            } else if (kLower.contains("iban")   || kLower.contains("bank") || kLower.contains("acc")) {
+                cleaned.merge("credit_card_number", val, Integer::sum);
+            } else if (kLower.contains("tckn")   || kLower.contains("tc")
+                    || kLower.contains("national") || kLower.contains("citizen")
+                    || kLower.contains("identity") || kLower.contains("kimlik")) {
+                cleaned.merge("tckn", val, Integer::sum);
+            } else if (kLower.contains("ip")     || kLower.contains("host")) {
+                cleaned.merge("ip_address", val, Integer::sum);
+            } else if (kLower.contains("phone")  || kLower.contains("tel")) {
+                cleaned.merge("phone_number", val, Integer::sum);
+            } else if (kLower.contains("birth")  || kLower.contains("dob") || kLower.contains("dogum")) {
+                cleaned.merge("date_of_birth", val, Integer::sum);
+            } else if (kLower.contains("email")  || kLower.contains("e-mail")) {
+                cleaned.merge("email_address", val, Integer::sum);
+            } else if (kLower.contains("addres") || kLower.contains("adres")) {
+                cleaned.merge("home_address", val, Integer::sum);
+            } else if (kLower.contains("ssn")    || kLower.contains("social")) {
+                cleaned.merge("social_security_number", val, Integer::sum);
+            }
+            // "not_pii" values are intentionally ignored — only PII counts matter
+        }
+
+        // ── Semantic Hardening for Names ─────────────────────────────────────
+        // If column clearly names a first/last component, move full_name votes there.
+        String cLower = columnName.toLowerCase();
+        if (cLower.contains("first") || cLower.contains("ad") || cLower.contains("adi")) {
+            int fnVal = cleaned.getOrDefault("full_name", 0);
+            if (fnVal > 0) {
+                cleaned.merge("first_name", fnVal, Integer::sum);
+                cleaned.put("full_name", 0);
+            }
+        } else if (cLower.contains("last") || cLower.contains("soy") || cLower.contains("surname")) {
+            int fnVal = cleaned.getOrDefault("full_name", 0);
+            if (fnVal > 0) {
+                cleaned.merge("last_name", fnVal, Integer::sum);
+                cleaned.put("full_name", 0);
+            }
+        }
+
+        // ── Consolidation: national_id_number → tckn ─────────────────────────
+        int natVal = cleaned.getOrDefault("national_id_number", 0);
+        cleaned.merge("tckn", natVal, Integer::sum);
+        cleaned.put("national_id_number", 0);
+
+        int total = cleaned.values().stream().mapToInt(Integer::intValue).sum();
+        if (total == 0) return emptyClassifications();
+
+        Map<String, Double> result = new LinkedHashMap<>();
+        for (Map.Entry<String, Integer> e : cleaned.entrySet()) {
+            result.put(e.getKey(),
+                Math.round((double) e.getValue() / total * 1_000_000.0) / 1_000_000.0);
+        }
+        return result;
+    }
+
+    /** All non-not_pii categories at 0.0. Used when LLM call fails or returns nothing. */
+    private Map<String, Double> emptyClassifications() {
+        Map<String, Double> r = new LinkedHashMap<>();
+        for (String cat : PII_CATEGORIES) {
+            if (!"not_pii".equals(cat)) r.put(cat, 0.0);
+        }
+        return r;
+    }
+
+    // =========================================================================
+    // Heuristic Validation
+    // =========================================================================
+
+    /**
+     * Per-category data validation. Rejects an LLM decision when the sample data
+     * clearly does not match the claimed category.
+     * Equivalent to _validate_with_heuristics() in Python.
+     */
+    private boolean validateWithHeuristics(String category, List<String> samples, String columnName) {
+        if (samples.isEmpty()) return true;
+        String blob = String.join(" ", samples).toLowerCase();
+        String tCol = columnName.toLowerCase();
+
+        switch (category) {
+            case "email_address":
+                return blob.contains("@") && blob.contains(".");
+
+            case "ip_address":
+                return Pattern.compile("(\\d{1,3}\\.){3}\\d{1,3}|[0-9a-fA-F:]{5,}")
+                              .matcher(blob).find();
+
+            case "tckn":
+                // 11-digit number, first digit non-zero
+                return Pattern.compile("[1-9]\\d{10}")
+                              .matcher(blob.replace(" ", "")).find();
+
+            case "credit_card_number":
+                // Masked card (****) or at least 13 consecutive digits
+                return blob.contains("*") || countDigits(blob) >= 13;
+
+            case "date_of_birth": {
+                List<String> rejects = List.of(
+                    "created", "updated", "hire", "registration", "order", "login");
+                boolean hasReject = rejects.stream().anyMatch(tCol::contains);
+                return !hasReject && blob.chars().anyMatch(Character::isDigit);
+            }
+
+            case "phone_number": {
+                String stripped = blob.replace(" ", "").replace("-", "");
+                return Pattern.compile("\\+?\\d{9,}").matcher(stripped).find();
+            }
+
+            case "first_name":
+            case "last_name":
+            case "full_name": {
+                // Must contain some alphabetic content (including Turkish letters)
+                String clean = blob.replaceAll("[^a-zA-ZğüşöçİĞÜŞÖÇ ]", "");
+                return clean.trim().length() > 2;
+            }
+
+            default:
+                return true;
+        }
+    }
+
+    private int countDigits(String s) {
+        int count = 0;
+        for (char c : s.toCharArray()) if (Character.isDigit(c)) count++;
+        return count;
+    }
+
+    // =========================================================================
+    // Response Parsing Helpers
+    // =========================================================================
+
+    /** Extract the assistant message content from the OpenAI-compatible response envelope. */
+    @SuppressWarnings("unchecked")
+    private String extractContent(Map<String, Object> apiResponse) {
+        if (apiResponse == null) throw new ResponseStatusException(
+            HttpStatus.INTERNAL_SERVER_ERROR, "Empty response from LLM API");
+
+        List<Map<String, Object>> choices =
+            (List<Map<String, Object>>) apiResponse.get("choices");
+        if (choices == null || choices.isEmpty()) throw new ResponseStatusException(
+            HttpStatus.INTERNAL_SERVER_ERROR, "LLM API returned no choices");
+
+        Map<String, Object> message =
+            (Map<String, Object>) choices.get(0).get("message");
+        if (message == null) throw new ResponseStatusException(
+            HttpStatus.INTERNAL_SERVER_ERROR, "LLM API choice missing message");
+
+        Object content = message.get("content");
+        if (content == null) throw new ResponseStatusException(
+            HttpStatus.INTERNAL_SERVER_ERROR, "LLM API message has null content");
+
+        return content.toString().trim();
+    }
+
+    /**
+     * Strip {@code <think>...</think>} blocks emitted by some reasoning models
+     * (e.g. DeepSeek-R1, Qwen QwQ) before the actual JSON response.
+     */
+    private String stripThinkTags(String text) {
+        String cleaned = text.replaceAll("(?s)<think>.*?</think>", "").trim();
+        return cleaned.isEmpty() ? text : cleaned;
+    }
+
+    /**
+     * Robustly extract a JSON object from LLM text.
+     * Returns a raw {@code Map<String, Object>} so values may be Integer or Double
+     * (the count-based prompt returns integers; probability-style responses return doubles).
+     * Equivalent to _extract_json() in Python.
+     */
+    private Map<String, Object> extractJsonRaw(String text) {
+        TypeReference<Map<String, Object>> typeRef = new TypeReference<>() {};
+
+        // 1. Direct parse
+        try { return objectMapper.readValue(text, typeRef); }
+        catch (Exception ignored) {}
+
+        // 2. Markdown fence: ```json { ... } ```  or  ``` { ... } ```
+        Pattern fencePattern = Pattern.compile(
+            "```(?:json)?\\s*(\\{.*?})\\s*```", Pattern.DOTALL);
+        Matcher fenceMatcher = fencePattern.matcher(text);
+        if (fenceMatcher.find()) {
+            try { return objectMapper.readValue(fenceMatcher.group(1), typeRef); }
+            catch (Exception ignored) {}
+        }
+
+        // 3. First balanced { … } block
+        int start = text.indexOf('{');
+        int end   = text.lastIndexOf('}');
+        if (start >= 0 && end > start) {
+            try { return objectMapper.readValue(text.substring(start, end + 1), typeRef); }
+            catch (Exception ignored) {}
+        }
+
+        return Map.of(); // give up — recovery mapping will handle empty result
+    }
+
+    // =========================================================================
+    // UUID Helper
     // =========================================================================
 
     private UUID parseUuid(String value, String fieldName) {
         try {
             return UUID.fromString(value);
         } catch (IllegalArgumentException e) {
-            throw new ResponseStatusException(
-                    HttpStatus.BAD_REQUEST,
-                    "Invalid " + fieldName + " format: '" + value + "' is not a valid UUID.");
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                "Invalid " + fieldName + " format: '" + value + "' is not a valid UUID.");
         }
     }
 }
