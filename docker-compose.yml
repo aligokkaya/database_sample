@@ -11,8 +11,6 @@ volumes:
 
 
 services:
-
-  # ── System Database ─────────────────────────────────────────────────────────
   db:
     image: postgres:15-alpine
     container_name: discovery_db
@@ -28,13 +26,12 @@ services:
     networks:
       - internal
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-discovery_db}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-discovery_db}" ]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
 
-  # ── Demo / Target Database ───────────────────────────────────────────────────
   demo_db:
     image: postgres:15-alpine
     container_name: demo_db
@@ -51,13 +48,12 @@ services:
     networks:
       - internal
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d llm_discovery_demo"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d llm_discovery_demo" ]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
 
-  # ── Ollama LLM Server ────────────────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
     container_name: discovery_ollama
@@ -69,13 +65,12 @@ services:
     networks:
       - internal
     healthcheck:
-      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      test: [ "CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1" ]
       interval: 15s
       timeout: 10s
       retries: 10
       start_period: 30s
 
-  # ── FastAPI Application ──────────────────────────────────────────────────────
   app:
     build:
       context: .
@@ -93,5 +88,34 @@ services:
       - internal
     volumes:
       - ./app:/app/app:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── Java Spring Boot API ─────────────────────────────────────────────────────
+  java_app:
+    build:
+      context: ./java
+      dockerfile: Dockerfile
+    container_name: discovery_java
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:-discovery_db}
+      DB_USERNAME: ${POSTGRES_USER:-postgres}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-24}
+      BASIC_AUTH_USERNAME: ${BASIC_AUTH_USERNAME:-admin}
+      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD:-admin123}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-ollama}
+      OPENAI_MODEL: ${OPENAI_MODEL:-qwen2.5:3b}
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
     extra_hosts:
       - "host.docker.internal:host-gateway"

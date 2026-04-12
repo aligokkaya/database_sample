@@ -1,6 +1,7 @@
 package com.kafein.discovery.dto;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
@@ -17,6 +18,7 @@ public class ClassifyRequest {
 
     @Min(value = 1, message = "sample_count must be at least 1")
     @Max(value = 1000, message = "sample_count must be at most 1000")
+    @Schema(defaultValue = "10", example = "10")
     @JsonProperty("sample_count")
     private int sampleCount = 10;
 

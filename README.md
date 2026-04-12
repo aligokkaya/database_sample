@@ -33,9 +33,9 @@ database_sample/
 ├── alembic/                    # Database migrations
 │   └── versions/
 │       └── 0001_initial_schema.py
-├── java/                       # Spring Boot 3.2 port (Task 2)
+├── java/                       # Spring Boot 3.2 port — serves on :8080
 ├── demo_db.sql                 # Sample database: customers, employees, audit_logs, payments
-├── docker-compose.yml          # Full stack: API + discovery_db + demo_db + Ollama
+├── docker-compose.yml          # Full stack: Python API + Java API + discovery_db + demo_db + Ollama
 ├── Dockerfile                  # Python API container
 ├── OPTIONAL_REGEX_APPROACH.md  # DB-level regex optimization (not included in submission)
 └── .env                        # Environment configuration
@@ -112,9 +112,11 @@ docker-compose up --build
 
 | Service | URL / Host | Notes |
 | :--- | :--- | :--- |
-| **API + Swagger UI** | `http://localhost:8000/docs` | Full interactive API docs |
-| **API Base URL** | `http://localhost:8000` | For curl / Postman |
-| **Discovery DB** | `localhost:5434` | System metadata database |
+| **Python API + Swagger UI** | `http://localhost:8000/docs` | FastAPI — full interactive docs |
+| **Python API Base URL** | `http://localhost:8000` | For curl / Postman |
+| **Java API + Swagger UI** | `http://localhost:8080/swagger-ui.html` | Spring Boot — full interactive docs |
+| **Java API Base URL** | `http://localhost:8080` | For curl / Postman |
+| **Discovery DB** | `localhost:5434` | System metadata database (shared) |
 | **Demo DB** | `localhost:5433` — db: `llm_discovery_demo` | Pre-seeded test data |
 | **Ollama** | `http://localhost:11434` | LLM inference server |
 

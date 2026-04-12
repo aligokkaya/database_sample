@@ -1,5 +1,6 @@
 package com.kafein.discovery.dto;
 
+import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
@@ -14,8 +15,9 @@ public class DiscoverRequest {
     private String metadataId;
 
     @Min(value = 1, message = "sample_count must be at least 1")
-    @Max(value = 100, message = "sample_count must be at most 100")
-    private int sampleCount = 5;
+    @Max(value = 1000, message = "sample_count must be at most 1000")
+    @Schema(defaultValue = "10", example = "10")
+    private int sampleCount = 10;
 
     // ---------- Constructors ----------
 
