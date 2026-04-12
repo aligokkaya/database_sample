@@ -18,7 +18,6 @@ class MetadataRecord(Base):
     database_name = Column(String(255), nullable=False)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
-    # Relationships
     db_connection = relationship(
         "DbConnection",
         back_populates="metadata_record",
@@ -53,7 +52,6 @@ class DbConnection(Base):
     encrypted_password = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
-    # Relationships
     metadata_record = relationship("MetadataRecord", back_populates="db_connection")
 
 
@@ -69,7 +67,6 @@ class TableInfo(Base):
     table_name = Column(String(255), nullable=False)
     schema_name = Column(String(255), nullable=False, default="public")
 
-    # Relationships
     metadata_record = relationship("MetadataRecord", back_populates="tables")
     columns = relationship(
         "ColumnInfo",
@@ -96,6 +93,5 @@ class ColumnInfo(Base):
     data_type = Column(String(255), nullable=False)
     ordinal_position = Column(Integer, nullable=False)
 
-    # Relationships
     table = relationship("TableInfo", back_populates="columns")
     metadata_record = relationship("MetadataRecord", back_populates="columns")

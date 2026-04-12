@@ -1,71 +1,21 @@
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.router import get_current_user
 from app.database import get_db
 from app.metadata import service
+from app.metadata.schemas import (
+    ConnectRequest,
+    ConnectResponse,
+    DeleteResponse,
+    MetadataDetailResponse,
+    MetadataListItem,
+)
 
 router = APIRouter(tags=["Metadata"])
 
-
-# ---------- Pydantic schemas ----------
-
-class ConnectRequest(BaseModel):
-    host: str = Field(..., description="Target DB hostname or IP")
-    port: int = Field(default=5432, description="Target DB port")
-    database: str = Field(..., description="Target database name")
-    username: str = Field(..., description="Target DB username")
-    password: str = Field(..., description="Target DB password")
-
-
-class ColumnOut(BaseModel):
-    column_id: str
-    column_name: str
-    data_type: str
-
-
-class TableOut(BaseModel):
-    table_name: str
-    columns: list[ColumnOut]
-
-
-class ConnectResponse(BaseModel):
-    metadata_id: str
-    database_name: str
-    table_count: int
-    tables: list[TableOut]
-
-
-class MetadataListItem(BaseModel):
-    metadata_id: str
-    database_name: str
-    created_at: str
-    table_count: int
-
-
-class TableDetailOut(BaseModel):
-    table_id: str
-    table_name: str
-    schema_name: str
-    columns: list[ColumnOut]
-
-
-class MetadataDetailResponse(BaseModel):
-    metadata_id: str
-    database_name: str
-    created_at: str
-    tables: list[TableDetailOut]
-
-
-class DeleteResponse(BaseModel):
-    status: str
-    metadata_id: str
-
-
-# ---------- Routes ----------
 
 @router.post(
     "/db/metadata",
@@ -84,7 +34,7 @@ async def connect_and_discover(
     structured summary.
     """
     try:
-        result = await service.create_metadata(
+        return await service.create_metadata(
             db=db,
             host=body.host,
             port=body.port,
@@ -92,7 +42,6 @@ async def connect_and_discover(
             username=body.username,
             password=body.password,
         )
-        return result
     except HTTPException:
         raise
     except Exception as exc:

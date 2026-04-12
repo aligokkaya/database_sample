@@ -4,8 +4,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
-from pydantic import BaseModel
 
+from app.auth.schemas import LoginRequest, TokenResponse
 from app.config import get_settings
 
 router = APIRouter()
@@ -13,31 +13,13 @@ settings = get_settings()
 security = HTTPBearer()
 
 
-# ---------- Pydantic schemas ----------
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    expires_in: int
-
-
-# ---------- JWT helpers ----------
-
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(hours=settings.JWT_EXPIRY_HOURS)
     )
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(
-        to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM
-    )
-    return encoded_jwt
+    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
 def verify_token(token: str) -> dict:
@@ -54,22 +36,15 @@ def verify_token(token: str) -> dict:
         ) from exc
 
 
-# ---------- Dependency ----------
-
 def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
 ) -> dict:
     return verify_token(credentials.credentials)
 
 
-# ---------- Route ----------
-
 @router.post("/auth", response_model=TokenResponse, tags=["Authentication"])
 async def login(body: LoginRequest) -> TokenResponse:
-    """
-    Authenticate with username and password.
-    Returns a JWT bearer token valid for JWT_EXPIRY_HOURS hours.
-    """
+    """Authenticate and return a JWT bearer token."""
     if (
         body.username != settings.BASIC_AUTH_USERNAME
         or body.password != settings.BASIC_AUTH_PASSWORD

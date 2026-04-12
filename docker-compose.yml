@@ -7,8 +7,8 @@ networks:
 volumes:
   postgres_data:
   demo_postgres_data:
-  clinic_postgres_data:
   ollama_data:
+
 
 services:
 
@@ -52,29 +52,6 @@ services:
       - internal
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d llm_discovery_demo"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-
-  # ── Clinic Test Database ─────────────────────────────────────────────────────
-  clinic_db:
-    image: postgres:15-alpine
-    container_name: clinic_db
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: clinic_db
-    volumes:
-      - clinic_postgres_data:/var/lib/postgresql/data
-      - ./test_db.sql:/docker-entrypoint-initdb.d/test_db.sql:ro
-    ports:
-      - "5435:5432"
-    networks:
-      - internal
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d clinic_db"]
       interval: 10s
       timeout: 5s
       retries: 5
