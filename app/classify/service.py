@@ -62,50 +62,72 @@ DIRECT_TYPE_MAP = {
     "cidr": "ip_address",
 }
 
-# ── Direct Column Name Mapping — obvious column names that bypass LLM ─────────
-DIRECT_COLUMN_MAP = {
-    # IP
-    "ip_address": "ip_address",
-    # Address
-    "street_address": "home_address",
-    "full_address": "home_address",
-    "address_line1": "home_address",
-    "address_line2": "home_address",
-    # Names
-    "first_name": "first_name",
-    "last_name": "last_name",
-    "full_name": "full_name",
-    "name": "full_name",
-    "ad": "first_name",
-    "soyad": "last_name",
-    # Email
-    "email": "email_address",
-    "email_address": "email_address",
-    "e_mail": "email_address",
-    # Turkish national ID
-    "national_id": "tckn",
-    "tc_no": "tckn",
-    "tc_kimlik": "tckn",
-    "kimlik_no": "tckn",
-    "tckn": "tckn",
-    # Phone
-    "phone": "phone_number",
-    "telephone": "phone_number",
-    "mobile": "phone_number",
-    "tel": "phone_number",
-    # IBAN / bank
-    "iban": "bank_account_iban",
-    "bank_account_iban": "bank_account_iban",
-    "bank_iban": "bank_account_iban",
-    # Tax
-    "tax_number": "tax_number",
-    "tax_no": "tax_number",
-    "vergi_no": "tax_number",
-    "vergi_numarasi": "tax_number",
-    # SSN
-    "social_security_number": "social_security_number",
-    "ssn": "social_security_number",
-}
+# ── Direct Column Name Patterns — substring match, first hit wins ─────────────
+# More specific patterns go first to avoid false positives.
+DIRECT_COLUMN_PATTERNS: list[tuple[str, str]] = [
+    # ── Names ──
+    ("full_name",        "full_name"),
+    ("fullname",         "full_name"),
+    ("given_name",       "first_name"),
+    ("name_first",       "first_name"),
+    ("first_name",       "first_name"),
+    ("family_name",      "last_name"),
+    ("name_last",        "last_name"),
+    ("last_name",        "last_name"),
+    # ── Email ──
+    ("email",            "email_address"),
+    # ── Phone / Mobile ──
+    ("mobile",           "phone_number"),
+    ("phone",            "phone_number"),
+    ("telephone",        "phone_number"),
+    # ── Address / Street ──
+    ("street",           "home_address"),
+    # ── Date of Birth ──
+    ("date_of_birth",    "date_of_birth"),
+    ("birth_date",       "date_of_birth"),
+    ("date_born",        "date_of_birth"),
+    ("_dob",             "date_of_birth"),   # holder_dob, patient_dob
+    ("birth",            "date_of_birth"),   # birthdate, birthday
+    ("born",             "date_of_birth"),   # date_born, born_on
+    # ── Turkish National ID ──
+    ("national_id",      "tckn"),
+    ("id_no",            "tckn"),            # holder_id_no, patient_id_no
+    ("tckn",             "tckn"),
+    ("tc_no",            "tckn"),
+    ("kimlik",           "tckn"),
+    # ── IBAN / Bank ──
+    ("iban",             "bank_account_iban"),
+    ("bank_account",     "bank_account_iban"),
+    # ── IP ──
+    ("ip_address",       "ip_address"),
+    # ── Tax ──
+    ("tax_number",       "tax_number"),
+    ("tax_no",           "tax_number"),
+    ("vergi",            "tax_number"),
+    # ── SSN ──
+    ("social_security",  "social_security_number"),
+    ("ssn",              "social_security_number"),
+]
+
+# Column name suffixes that always indicate non-PII (type/mode/status columns)
+_NON_PII_COL_SUFFIXES = (
+    "_type", "_kind", "_mode", "_status", "_flag",
+    "_code", "_brand", "_model", "_category", "_class", "_label",
+)
+
+def _direct_col_match(col_name_lower: str) -> str | None:
+    """
+    Returns a PII category if the column name clearly signals a PII field.
+    Uses substring matching so e.g. 'holder_fullname', 'mobile_contact',
+    'name_first' are all caught. Returns None if no pattern matches.
+    """
+    # Suffix exclusion: _type / _status / etc. are never PII data columns
+    if col_name_lower.endswith(_NON_PII_COL_SUFFIXES):
+        return None
+    for pattern, cat in DIRECT_COLUMN_PATTERNS:
+        if pattern in col_name_lower:
+            return cat
+    return None
 
 # ── Core Logic ────────────────────────────────────────────────────────────────
 
@@ -230,13 +252,13 @@ def _execute_discovery_pipeline(table_name: str, col_name: str, dtype: str, db_c
         direct[cat] = 1.0
         return {"top_category": cat, "top_probability": 1.0, "classifications": direct, "sample_count": 0}
 
-    # 2. Direct column name mapping (bypasses LLM for obvious PII columns)
-    if t_col in DIRECT_COLUMN_MAP:
-        cat = DIRECT_COLUMN_MAP[t_col]
+    # 2. Direct column name pattern match (bypasses LLM for obvious PII columns)
+    direct_cat = _direct_col_match(t_col)
+    if direct_cat:
         direct = {c: 0.0 for c in PII_CATEGORIES if c != "not_pii"}
-        direct[cat] = 1.0
-        print(f"DEBUG: [DIRECT MAP] {table_name}.{col_name} -> {cat}", flush=True)
-        return {"top_category": cat, "top_probability": 1.0, "classifications": direct, "sample_count": 0}
+        direct[direct_cat] = 1.0
+        print(f"DEBUG: [DIRECT MATCH] {table_name}.{col_name} -> {direct_cat}", flush=True)
+        return {"top_category": direct_cat, "top_probability": 1.0, "classifications": direct, "sample_count": 0}
 
     is_sens = any(p in t_col for p in ["national", "citizen", "tax", "tckn", "social", "identity", "id_no", "kimlik", "iban", "policy", "dob", "birth", "email", "phone", "address"])
     if (any(kw in t_col for kw in NEGATIVE_PII_KEYWORDS) or t_col.endswith("_id")) and not is_sens: return empty
