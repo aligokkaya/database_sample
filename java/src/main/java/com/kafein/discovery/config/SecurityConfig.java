@@ -1,6 +1,7 @@
 package com.kafein.discovery.config;
 
 import com.kafein.discovery.security.JwtAuthFilter;
+import com.kafein.discovery.security.CustomAuthenticationEntryPoint;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
@@ -25,9 +26,11 @@ import java.util.List;
 public class SecurityConfig {
 
     private final JwtAuthFilter jwtAuthFilter;
+    private final CustomAuthenticationEntryPoint customAuthenticationEntryPoint;
 
-    public SecurityConfig(JwtAuthFilter jwtAuthFilter) {
+    public SecurityConfig(JwtAuthFilter jwtAuthFilter, CustomAuthenticationEntryPoint customAuthenticationEntryPoint) {
         this.jwtAuthFilter = jwtAuthFilter;
+        this.customAuthenticationEntryPoint = customAuthenticationEntryPoint;
     }
 
     @Bean
@@ -47,6 +50,7 @@ public class SecurityConfig {
                 // All other endpoints require a valid JWT
                 .anyRequest().authenticated()
             )
+            .exceptionHandling(ex -> ex.authenticationEntryPoint(customAuthenticationEntryPoint))
             .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
 
         return http.build();

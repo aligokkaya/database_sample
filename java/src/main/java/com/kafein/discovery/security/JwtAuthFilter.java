@@ -60,8 +60,15 @@ public class JwtAuthFilter extends OncePerRequestFilter {
                     SecurityContextHolder.getContext().setAuthentication(authToken);
                 }
             } catch (JwtException | IllegalArgumentException e) {
-                // Invalid token – do not set authentication; Spring Security will reject
+                // Invalid or expired token — write JSON response directly
                 logger.debug("JWT validation failed: " + e.getMessage());
+                
+                response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                response.setContentType("application/json");
+                response.setCharacterEncoding("UTF-8");
+                String json = "{\"detail\": \"Seansınızın süresi dolmuş veya geçersiz bir token kullandınız. Lütfen /auth endpoint'inden yeni bir token alın.\"}";
+                response.getWriter().write(json);
+                return; // Stop filter chain
             }
         }
 

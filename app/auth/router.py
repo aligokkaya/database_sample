@@ -10,7 +10,7 @@ from app.config import get_settings
 
 router = APIRouter()
 settings = get_settings()
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
@@ -28,17 +28,23 @@ def verify_token(token: str) -> dict:
             token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
         )
         return payload
-    except JWTError as exc:
+    except JWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
+            detail="Seansınızın süresi dolmuş veya geçersiz bir token kullandınız. Lütfen /auth endpoint'inden yeni bir token alın.",
             headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
+        )
 
 
 def get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)],
 ) -> dict:
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Bu kaynağa erişmek için yetkilendirme gereklidir. Lütfen /auth endpoint'ini kullanarak geçerli bir JWT token edinin.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return verify_token(credentials.credentials)
 
 
