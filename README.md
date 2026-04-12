@@ -15,21 +15,29 @@
 ```
 database_sample/
 ├── app/                        # FastAPI application (Python)
-│   ├── auth/                   # JWT & Basic Auth
+│   ├── auth/
+│   │   ├── router.py           # POST /auth — JWT login endpoint + token verification
+│   │   └── schemas.py          # LoginRequest, TokenResponse
 │   ├── classify/               # PII classification engine
 │   │   ├── router.py           # POST /classify, POST /classify/discover
+│   │   ├── schemas.py          # ClassifyRequest/Response, DiscoverRequest/Response
 │   │   └── service.py          # 8-phase detection pipeline (core logic)
 │   ├── metadata/               # Schema discovery & persistence
 │   │   ├── router.py           # CRUD endpoints for metadata
+│   │   ├── schemas.py          # ConnectRequest/Response, MetadataDetailResponse, etc.
 │   │   └── service.py          # psycopg2 + SQLAlchemy async ORM
-│   ├── models.py               # SQLAlchemy ORM models
-│   ├── config.py               # Settings via pydantic-settings
-│   └── main.py                 # FastAPI app entry point
+│   ├── models.py               # SQLAlchemy ORM models (MetadataRecord, TableInfo, ColumnInfo, DbConnection)
+│   ├── database.py             # Async SQLAlchemy session & Base
+│   ├── config.py               # Settings via pydantic-settings (.env binding)
+│   └── main.py                 # FastAPI app entry point, router registration
 ├── alembic/                    # Database migrations
-├── java/                       # Spring Boot port (Task 2)
-├── demo_db.sql                 # Sample database: customers, employees, audit logs
-├── docker-compose.yml          # Full stack: API + discovery_db + demo DBs
+│   └── versions/
+│       └── 0001_initial_schema.py
+├── java/                       # Spring Boot 3.2 port (Task 2)
+├── demo_db.sql                 # Sample database: customers, employees, audit_logs, payments
+├── docker-compose.yml          # Full stack: API + discovery_db + demo_db + Ollama
 ├── Dockerfile                  # Python API container
+├── OPTIONAL_REGEX_APPROACH.md  # DB-level regex optimization (not included in submission)
 └── .env                        # Environment configuration
 ```
 
@@ -118,7 +126,7 @@ All API endpoints are protected. Obtain a JWT token before making requests:
 
 ```bash
 # Get token
-curl -X POST http://localhost:8000/auth/token \
+curl -X POST http://localhost:8000/auth \
   -H "Content-Type: application/json" \
   -d '{"username": "admin", "password": "admin123"}'
 
@@ -532,7 +540,7 @@ The entire Java port (`java/` directory) was built from scratch with **Cursor AI
 >
 > *Technical requirements:*
 > - *Spring Data JPA with PostgreSQL, `@OneToMany`/`@ManyToOne` relationships between `MetadataRecord`, `TableInfo`, `ColumnInfo`, `DbConnection` entities — mirror the Python SQLAlchemy models exactly*
-> - *JWT authentication: `/auth/token` endpoint accepts username/password, returns bearer token, all other endpoints require the token via `Authorization: Bearer` header*
+> - *JWT authentication: `POST /auth` endpoint accepts username/password, returns bearer token, all other endpoints require the token via `Authorization: Bearer` header*
 > - *AES/CBC encryption to store target DB passwords at rest (Python side uses Fernet — implement an equivalent `EncryptionService` in Java)*
 > - *`RestTemplate` for calling the OpenAI-compatible LLM API*
 > - *Springdoc OpenAPI 2 for Swagger UI at `/swagger-ui.html`*
@@ -606,7 +614,7 @@ System reliability was verified using **Antigravity**, an autonomous AI agent th
 
 > *"The Docker stack is up and running. I want you to run a complete end-to-end PII discovery test autonomously and give me a detailed gap analysis. Here are the exact steps:*
 >
-> *1. Call `POST http://localhost:8000/auth/token` with body `{"username": "admin", "password": "admin123"}` and save the JWT token from the response.*
+> *1. Call `POST http://localhost:8000/auth` with body `{"username": "admin", "password": "admin123"}` and save the JWT token from the response.*
 >
 > *2. Using that token, call `POST http://localhost:8000/db/metadata` with body:*
 > ```json
