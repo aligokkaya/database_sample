@@ -362,9 +362,36 @@ For highly structured PII categories — emails, TCKNs, credit cards, phone numb
 
 **Why it wasn't included:** The case study explicitly requires *"data classification using LLM"*. Including a regex-first shortcut would technically deviate from that requirement, so this layer was refactored out of the final submission. However, in a real production system scanning millions of rows, this optimization would be the logical next step — it would reduce LLM token consumption significantly while keeping detection accuracy identical for rule-based categories.
 
+### 🦙 Ollama Setup & AI Models
+
+The discovery engine requires a running Ollama instance to perform classification. You have two options for running Ollama:
+
+#### Option A: Running inside Docker (Easier, but slower on Mac/Windows)
+If you use the provided `docker-compose.yml`, Ollama will start automatically as a container.
+- **Base URL:** `http://ollama:11434/v1`
+- **Setup:** It will be ready as soon as the container starts.
+
+#### Option B: Running Locally on Host (Recommended for GPU Acceleration)
+Running Ollama natively on your Mac (M1/M2/M3) or Windows (NVIDIA) is much faster because it leverages native GPU acceleration (Metal/CUDA).
+
+1.  **Download & Install:** Get Ollama from [ollama.com](https://ollama.com).
+2.  **Pull the Model:** Open your terminal and run:
+    ```bash
+    ollama pull qwen2.5:3b
+    ```
+3.  **Configure `.env`:** Update your `.env` file to point to the host machine from inside the Docker containers:
+    ```env
+    OPENAI_BASE_URL=http://host.docker.internal:11434/v1
+    ```
+    *Note: `host.docker.internal` allows Docker containers to communicate with services running on your host machine.*
+
+4.  **Hardware Requirements:**
+    - **Minimum:** 8GB RAM (for 3B models).
+    - **Recommended:** 16GB+ RAM and GPU for real-time inference.
+
 ---
 
-## ⚙️ Advanced Configuration (Beast Mode)
+## 🛠️ AI-Native Development Workflow
 
 To achieve **10x faster discovery**, bypass Docker's CPU limitations and use your host's GPU:
 
